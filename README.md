@@ -36,7 +36,7 @@ python src/vibevoice/cli.py
 ## Requirements 📋
 
 ### Python Dependencies
-- Python 3.12 or higher
+- Python 3.13 or higher
 
 ### System Requirements
 - CUDA-capable GPU (recommended) -> in server.py you can enable cpu use
