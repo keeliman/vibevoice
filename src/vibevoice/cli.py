@@ -71,16 +71,24 @@ class VisualIndicator:
         import time
         colors = {
             "dictation": "\033[92m",  # Green
-            "command": "\033[94m"     # Blue
+            "command": "\033[94m",    # Blue
+            "screenshot": "\033[95m"  # Magenta
+        }
+        icons = {
+            "dictation": ["🎙️", "🎤"],
+            "command": ["🤖", "🎯"],
+            "screenshot": ["📷", "🖼️"]
         }
         color = colors.get(mode, "\033[93m")  # Yellow default
+        mode_icons = icons.get(mode, ["🎙️", "🎤"])
         reset = "\033[0m"
         
+        icon_index = 0
         while self.recording:
-            print(f"{color}🎙️  RECORDING ({mode.upper()}) {reset}", end="\r")
+            current_icon = mode_icons[icon_index % len(mode_icons)]
+            print(f"{color}{current_icon} RECORDING ({mode.upper()}) {reset}", end="\r")
             time.sleep(0.5)
-            print(f"{color}🎤 RECORDING ({mode.upper()}) {reset}", end="\r")
-            time.sleep(0.5)
+            icon_index += 1
         print(" " * 50, end="\r")  # Clear the line
 
 def play_sound(sound_type):
@@ -262,7 +270,7 @@ def capture_screenshot():
             pass
         return None, None
 
-def _process_llm_cmd(keyboard_controller, transcript):
+def _process_llm_cmd(keyboard_controller, transcript, force_screenshot=False):
     """Process transcript with Ollama and type the response."""
 
     try:
@@ -286,12 +294,17 @@ def _process_llm_cmd(keyboard_controller, transcript):
             print("Invalid OLLAMA_MODEL, using default")
             model = 'gemma3:27b'
         
-        # Disable screenshots on macOS by default due to workspace limitations
-        include_screenshot_str = os.getenv('INCLUDE_SCREENSHOT', 'false').lower()
-        include_screenshot = include_screenshot_str in ('true', '1', 'yes', 'on')
+        # Screenshot logic: force for screenshot mode, or check env var
+        if force_screenshot:
+            include_screenshot = SCREENSHOT_AVAILABLE
+            print("📷 Screenshot mode: capturing screen context...")
+        else:
+            # Disable screenshots on macOS by default due to workspace limitations
+            include_screenshot_str = os.getenv('INCLUDE_SCREENSHOT', 'false').lower()
+            include_screenshot = include_screenshot_str in ('true', '1', 'yes', 'on') and SCREENSHOT_AVAILABLE
         
         screenshot_path, screenshot_base64 = (None, None)
-        if include_screenshot and SCREENSHOT_AVAILABLE:
+        if include_screenshot:
             screenshot_path, screenshot_base64 = capture_screenshot()
         
         user_prompt = transcript
@@ -327,13 +340,14 @@ Your responses will be directly typed into the user's keyboard at their cursor p
         else:
             print(f"Sending text-only request to model: {model}")
         
-        # Security: add timeout and size limits
+        # Security: add timeout and size limits (longer timeout for screenshots)
+        timeout_seconds = 60 if screenshot_base64 else 30  # 60s for screenshots, 30s for text
         try:
             response = requests.post(
                 url, 
                 json=payload, 
                 stream=True,
-                timeout=30,  # 30 second timeout
+                timeout=timeout_seconds,
                 headers={
                     'Content-Type': 'application/json',
                     'User-Agent': 'VibeVoice/1.0'
@@ -341,9 +355,12 @@ Your responses will be directly typed into the user's keyboard at their cursor p
             )
             response.raise_for_status()
         except requests.exceptions.Timeout:
-            raise Exception("Request timeout - Ollama server may be overloaded")
+            if screenshot_base64:
+                raise Exception(f"Request timeout ({timeout_seconds}s) - Screenshots require more processing time. Try a lighter model or check Ollama performance.")
+            else:
+                raise Exception("Request timeout - Ollama server may be overloaded")
         except requests.exceptions.ConnectionError:
-            raise Exception("Cannot connect to Ollama server")
+            raise Exception("Cannot connect to Ollama server. Make sure Ollama is running.")
         except requests.exceptions.RequestException as e:
             raise Exception(f"Request failed: {e}")
         
@@ -397,11 +414,14 @@ def main():
     load_dotenv()
     key_label = os.environ.get("VOICEKEY", "cmd_r")
     cmd_label = os.environ.get("VOICEKEY_CMD", "f12")
+    screenshot_cmd_label = os.environ.get("VOICEKEY_SCREENSHOT", "alt_r")
     RECORD_KEY = Key[key_label]
     CMD_KEY = Key[cmd_label]
+    SCREENSHOT_CMD_KEY = Key[screenshot_cmd_label]
 #    CMD_KEY = KeyCode(vk=65027)  # This is how you can use non-standard keys, this is AltGr for me
 
     recording = False
+    processing = False  # Prevent double processing
     audio_data = []
     sample_rate = 16000
     keyboard_controller = KeyboardController()
@@ -422,14 +442,32 @@ def main():
             visual_indicator.show_recording(mode)
             notification_manager.recording_started(mode)
             print(f"\n🤖 Started {mode} recording...")
+        elif key == SCREENSHOT_CMD_KEY and not recording:
+            recording = True
+            audio_data = []
+            mode = "screenshot"
+            visual_indicator.show_recording(mode)
+            notification_manager.recording_started(mode)
+            print(f"\n📷 Started {mode} recording (with context)...")
 
     def on_release(key):
-        nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY:
+        nonlocal recording, processing, audio_data
+        if key == RECORD_KEY or key == CMD_KEY or key == SCREENSHOT_CMD_KEY:
+            if not recording or processing:
+                return  # Already processed or not recording
+            
             recording = False
+            processing = True  # Prevent double processing
             visual_indicator.hide_recording()
             notification_manager.recording_stopped()
-            mode = "dictation" if key == RECORD_KEY else "command"
+            
+            if key == RECORD_KEY:
+                mode = "dictation"
+            elif key == CMD_KEY:
+                mode = "command"
+            else:  # SCREENSHOT_CMD_KEY
+                mode = "screenshot"
+            
             print(f"\n⏹️  Stopped {mode} recording. Transcribing...")
             
             try:
@@ -454,7 +492,10 @@ def main():
                     keyboard_controller.type(processed_transcript)
                     notification_manager.transcription_complete(transcript)
                 elif transcript and key == CMD_KEY:
-                    success = _process_llm_cmd(keyboard_controller, transcript)
+                    success = _process_llm_cmd(keyboard_controller, transcript, force_screenshot=False)
+                    notification_manager.ai_processing_complete(success is not None)
+                elif transcript and key == SCREENSHOT_CMD_KEY:
+                    success = _process_llm_cmd(keyboard_controller, transcript, force_screenshot=True)
                     notification_manager.ai_processing_complete(success is not None)
             except requests.exceptions.RequestException as e:
                 print(f"Error sending request to local API: {e}")
@@ -462,6 +503,8 @@ def main():
             except Exception as e:
                 print(f"Error processing transcript: {e}")
                 notification_manager.transcription_error(str(e))
+            finally:
+                processing = False  # Reset processing flag
 
     def callback(indata, frames, time, status):
         if status:
@@ -478,6 +521,7 @@ def main():
         print(f"\n🎉 VIBEVOICE IS ACTIVE! 🎉")
         print(f"🎙️  Dictation: Hold down {key_label} (⌘ droite)")
         print(f"🤖 AI Commands: Hold down {cmd_label} (F12)")
+        print(f"📷 AI with Screenshot: Hold down {screenshot_cmd_label} (Option droite)")
         print(f"🔔 Sound notifications: {'Enabled' if notification_manager.sound_enabled else 'Disabled'}")
         print(f"👁️  Visual notifications: {'Enabled' if notification_manager.visual_enabled else 'Disabled'}")
         print(f"💡 Legacy audio: {'Enabled' if AUDIO_AVAILABLE else 'Disabled'}")

@@ -68,7 +68,8 @@ class NotificationManager:
             return
             
         try:
-            await self.desktop_notifier.send_notification(
+            # Use desktop notifier send API directly
+            await self.desktop_notifier.send(
                 title=title,
                 message=message,
                 timeout=timeout
