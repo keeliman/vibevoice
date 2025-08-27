@@ -7,9 +7,10 @@ from faster_whisper import WhisperModel
 
 app = FastAPI()
 
-model = WhisperModel("large", device="cuda", compute_type="float16")
-# Enable in case you want to run on CPU, but it's much slower
-#model = WhisperModel("medium", device="cpu", compute_type="int8")
+# Use CPU on macOS since CUDA is not supported
+model = WhisperModel("medium", device="cpu", compute_type="int8")
+# Enable in case you want to run on GPU (Linux/Windows with CUDA)
+#model = WhisperModel("large", device="cuda", compute_type="float16")
 
 class TranscribeRequest(BaseModel):
     file_path: str
