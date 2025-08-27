@@ -24,12 +24,120 @@ from scipy.io import wavfile
 from dotenv import load_dotenv
 
 from loading_indicator import LoadingIndicator
+from notifications import NotificationManager
+import threading
+import pygame
 
 loading_indicator = LoadingIndicator()
+notification_manager = NotificationManager()
+
+# Initialize pygame for audio feedback (legacy support)
+try:
+    pygame.mixer.init()
+    AUDIO_AVAILABLE = True
+except:
+    AUDIO_AVAILABLE = False
+    print("Legacy audio feedback not available")
+
+class VisualIndicator:
+    def __init__(self):
+        self.recording = False
+        self.thread = None
+        
+    def show_recording(self, mode="dictation"):
+        """Show visual recording indicator"""
+        if self.thread and self.thread.is_alive():
+            return
+            
+        self.recording = True
+        self.thread = threading.Thread(target=self._recording_animation, args=(mode,))
+        self.thread.daemon = True
+        self.thread.start()
+        
+    def hide_recording(self):
+        """Hide visual recording indicator"""
+        self.recording = False
+        if self.thread:
+            self.thread.join(timeout=0.1)
+            
+    def _recording_animation(self, mode):
+        """Animated recording indicator"""
+        import time
+        colors = {
+            "dictation": "\033[92m",  # Green
+            "command": "\033[94m"     # Blue
+        }
+        color = colors.get(mode, "\033[93m")  # Yellow default
+        reset = "\033[0m"
+        
+        while self.recording:
+            print(f"{color}🎙️  RECORDING ({mode.upper()}) {reset}", end="\r")
+            time.sleep(0.5)
+            print(f"{color}🎤 RECORDING ({mode.upper()}) {reset}", end="\r")
+            time.sleep(0.5)
+        print(" " * 50, end="\r")  # Clear the line
+
+def play_sound(sound_type):
+    """Play audio feedback with modern, pleasant sounds"""
+    if not AUDIO_AVAILABLE:
+        return
+        
+    try:
+        sample_rate = 44100
+        duration = 0.15
+        
+        if sound_type == "start":
+            # Modern "ding" sound - ascending chord
+            t = np.linspace(0, duration, int(sample_rate * duration))
+            
+            # Create a pleasant ascending chord (C major triad)
+            wave1 = np.sin(2 * np.pi * 523.25 * t)  # C5
+            wave2 = np.sin(2 * np.pi * 659.25 * t)  # E5  
+            wave3 = np.sin(2 * np.pi * 783.99 * t)  # G5
+            
+            # Blend the waves with fade in/out
+            fade_samples = int(0.05 * sample_rate)
+            fade_in = np.linspace(0, 1, fade_samples)
+            fade_out = np.linspace(1, 0, fade_samples)
+            
+            wave = (wave1 + wave2 + wave3) / 3
+            wave[:fade_samples] *= fade_in
+            wave[-fade_samples:] *= fade_out
+            
+            # Normalize and convert
+            wave = (wave * 0.3 * 32767).astype(np.int16)
+            
+        elif sound_type == "stop":
+            # Modern "dong" sound - descending chord
+            t = np.linspace(0, duration, int(sample_rate * duration))
+            
+            # Create a pleasant descending chord (F major triad)
+            wave1 = np.sin(2 * np.pi * 349.23 * t)  # F4
+            wave2 = np.sin(2 * np.pi * 440.00 * t)  # A4
+            wave3 = np.sin(2 * np.pi * 523.25 * t)  # C5
+            
+            # Blend the waves with fade in/out
+            fade_samples = int(0.05 * sample_rate)
+            fade_in = np.linspace(0, 1, fade_samples)
+            fade_out = np.linspace(1, 0, fade_samples)
+            
+            wave = (wave1 + wave2 + wave3) / 3
+            wave[:fade_samples] *= fade_in
+            wave[-fade_samples:] *= fade_out
+            
+            # Normalize and convert
+            wave = (wave * 0.3 * 32767).astype(np.int16)
+        
+        pygame.mixer.Sound(wave).play()
+        
+    except Exception as e:
+        print(f"Audio error: {e}")
+
+visual_indicator = VisualIndicator()
 
 def start_whisper_server():
     server_script = os.path.join(os.path.dirname(__file__), 'server.py')
-    process = subprocess.Popen(['python', server_script])
+    process = subprocess.Popen(['python3', server_script])
     return process
 
 def wait_for_server(timeout=1800, interval=0.5):
@@ -54,18 +162,33 @@ def capture_screenshot():
         screenshot_path = os.path.abspath('screenshot.png')
         print(f"Capturing screenshot to: {screenshot_path}")
         
-        screenshot = pyautogui.screenshot()
+        # Try using macOS native screenshot command first
+        try:
+            import subprocess
+            result = subprocess.run(['screencapture', '-x', screenshot_path], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and os.path.exists(screenshot_path):
+                print("Used macOS native screenshot")
+            else:
+                raise Exception("Native screenshot failed")
+        except Exception as e:
+            print(f"Native screenshot failed: {e}, falling back to pyautogui")
+            # Fallback to pyautogui
+            screenshot = pyautogui.screenshot()
+            screenshot.save(screenshot_path)
         
-        max_width = int(os.getenv('SCREENSHOT_MAX_WIDTH', '1024'))
-        width, height = screenshot.size
-        
-        if width > max_width:
-            ratio = max_width / width
-            new_width = max_width
-            new_height = int(height * ratio)
-            screenshot = screenshot.resize((new_width, new_height))
-        
-        screenshot.save(screenshot_path)
+        # Resize if needed
+        from PIL import Image
+        with Image.open(screenshot_path) as img:
+            max_width = int(os.getenv('SCREENSHOT_MAX_WIDTH', '1024'))
+            width, height = img.size
+            
+            if width > max_width:
+                ratio = max_width / width
+                new_width = max_width
+                new_height = int(height * ratio)
+                img = img.resize((new_width, new_height))
+                img.save(screenshot_path)
         
         with open(screenshot_path, "rb") as image_file:
             base64_data = base64.b64encode(image_file.read()).decode('utf-8')
@@ -82,7 +205,8 @@ def _process_llm_cmd(keyboard_controller, transcript):
         loading_indicator.show(message=f"Processing: {transcript}")
         
         model = os.getenv('OLLAMA_MODEL', 'gemma3:27b')
-        include_screenshot = os.getenv('INCLUDE_SCREENSHOT', 'true').lower() == 'true'
+        # Disable screenshots on macOS by default due to workspace limitations
+        include_screenshot = os.getenv('INCLUDE_SCREENSHOT', 'false').lower() == 'true'
         
         screenshot_path, screenshot_base64 = (None, None)
         if include_screenshot and SCREENSHOT_AVAILABLE:
@@ -146,8 +270,8 @@ Your responses will be directly typed into the user's keyboard at their cursor p
 
 def main():
     load_dotenv()
-    key_label = os.environ.get("VOICEKEY", "ctrl_r")
-    cmd_label = os.environ.get("VOICEKEY_CMD", "scroll_lock")
+    key_label = os.environ.get("VOICEKEY", "cmd_r")
+    cmd_label = os.environ.get("VOICEKEY_CMD", "f12")
     RECORD_KEY = Key[key_label]
     CMD_KEY = Key[cmd_label]
 #    CMD_KEY = KeyCode(vk=65027)  # This is how you can use non-standard keys, this is AltGr for me
@@ -159,16 +283,29 @@ def main():
 
     def on_press(key):
         nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY and not recording:
+        if key == RECORD_KEY and not recording:
             recording = True
             audio_data = []
-            print("Listening...")
+            mode = "dictation"
+            visual_indicator.show_recording(mode)
+            notification_manager.recording_started(mode)
+            print(f"\n🎙️  Started {mode} recording...")
+        elif key == CMD_KEY and not recording:
+            recording = True
+            audio_data = []
+            mode = "command"
+            visual_indicator.show_recording(mode)
+            notification_manager.recording_started(mode)
+            print(f"\n🤖 Started {mode} recording...")
 
     def on_release(key):
         nonlocal recording, audio_data
         if key == RECORD_KEY or key == CMD_KEY:
             recording = False
-            print("Transcribing...")
+            visual_indicator.hide_recording()
+            notification_manager.recording_stopped()
+            mode = "dictation" if key == RECORD_KEY else "command"
+            print(f"\n⏹️  Stopped {mode} recording. Transcribing...")
             
             try:
                 audio_data_np = np.concatenate(audio_data, axis=0)
@@ -190,12 +327,16 @@ def main():
                     processed_transcript = transcript + " "
                     print(processed_transcript)
                     keyboard_controller.type(processed_transcript)
+                    notification_manager.transcription_complete(transcript)
                 elif transcript and key == CMD_KEY:
-                    _process_llm_cmd(keyboard_controller, transcript)
+                    success = _process_llm_cmd(keyboard_controller, transcript)
+                    notification_manager.ai_processing_complete(success is not None)
             except requests.exceptions.RequestException as e:
                 print(f"Error sending request to local API: {e}")
+                notification_manager.transcription_error(str(e))
             except Exception as e:
                 print(f"Error processing transcript: {e}")
+                notification_manager.transcription_error(str(e))
 
     def callback(indata, frames, time, status):
         if status:
@@ -208,12 +349,20 @@ def main():
     try:
         print(f"Waiting for the server to be ready...")
         wait_for_server()
-        print(f"vibevoice is active. Hold down {key_label} to start dictating.")
+        notification_manager.server_ready()
+        print(f"\n🎉 VIBEVOICE IS ACTIVE! 🎉")
+        print(f"🎙️  Dictation: Hold down {key_label} (⌘ droite)")
+        print(f"🤖 AI Commands: Hold down {cmd_label} (F12)")
+        print(f"🔔 Sound notifications: {'Enabled' if notification_manager.sound_enabled else 'Disabled'}")
+        print(f"👁️  Visual notifications: {'Enabled' if notification_manager.visual_enabled else 'Disabled'}")
+        print(f"💡 Legacy audio: {'Enabled' if AUDIO_AVAILABLE else 'Disabled'}")
+        print(f"⏹️  Press Ctrl+C to stop\n")
         with Listener(on_press=on_press, on_release=on_release) as listener:
             with sd.InputStream(callback=callback, channels=1, samplerate=sample_rate):
                 listener.join()
     except TimeoutError as e:
         print(f"Error: {e}")
+        notification_manager.server_error()
         server_process.terminate()
         sys.exit(1)
     except KeyboardInterrupt:
