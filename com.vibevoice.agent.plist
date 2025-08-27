@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vibevoice.agent</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>VIBEVOICE_APP_PATH/src/vibevoice/cli.py</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>VIBEVOICE_APP_PATH</string>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>VIBEVOICE_LOG_PATH/stdout.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>VIBEVOICE_LOG_PATH/stderr.log</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:PYTHON_BIN_PATH</string>
+        <key>PYTHONPATH</key>
+        <string>VIBEVOICE_APP_PATH/src</string>
+    </dict>
+    
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>1024</integer>
+        <key>Core</key>
+        <integer>0</integer>
+    </dict>
+    
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>2048</integer>
+        <key>FileSize</key>
+        <integer>104857600</integer>
+    </dict>
+</dict>
+</plist>

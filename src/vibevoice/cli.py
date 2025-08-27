@@ -23,8 +23,14 @@ from pynput.keyboard import Controller as KeyboardController, Key, Listener, Key
 from scipy.io import wavfile
 from dotenv import load_dotenv
 
-from loading_indicator import LoadingIndicator
-from notifications import NotificationManager
+try:
+    # Try relative imports first (when run as module)
+    from .loading_indicator import LoadingIndicator
+    from .notifications import NotificationManager
+except ImportError:
+    # Fall back to absolute imports (when run as script)
+    from loading_indicator import LoadingIndicator
+    from notifications import NotificationManager
 import threading
 import pygame
 
@@ -159,36 +165,88 @@ def capture_screenshot():
         return None, None
         
     try:
-        screenshot_path = os.path.abspath('screenshot.png')
+        import tempfile
+        import shlex
+        
+        # Security: use secure temporary file instead of predictable name
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False, prefix='vibevoice_screenshot_') as temp_file:
+            screenshot_path = temp_file.name
+        
         print(f"Capturing screenshot to: {screenshot_path}")
+        
+        # Security: validate screenshot path is in temp directory
+        if not screenshot_path.startswith(tempfile.gettempdir()):
+            raise ValueError("Screenshot path outside temporary directory")
         
         # Try using macOS native screenshot command first
         try:
             import subprocess
-            result = subprocess.run(['screencapture', '-x', screenshot_path], 
-                                  capture_output=True, text=True, timeout=5)
+            # Security: use absolute path to screencapture and properly escape filename
+            screencapture_path = '/usr/sbin/screencapture'
+            if not os.path.exists(screencapture_path):
+                raise Exception("screencapture command not found")
+                
+            result = subprocess.run([
+                screencapture_path, '-x', screenshot_path
+            ], capture_output=True, text=True, timeout=5)
+            
             if result.returncode == 0 and os.path.exists(screenshot_path):
                 print("Used macOS native screenshot")
             else:
-                raise Exception("Native screenshot failed")
+                raise Exception(f"Native screenshot failed: {result.stderr}")
         except Exception as e:
             print(f"Native screenshot failed: {e}, falling back to pyautogui")
             # Fallback to pyautogui
             screenshot = pyautogui.screenshot()
             screenshot.save(screenshot_path)
         
-        # Resize if needed
+        # Security: validate file was created and is reasonable size
+        if not os.path.exists(screenshot_path):
+            raise Exception("Screenshot file was not created")
+            
+        file_size = os.path.getsize(screenshot_path)
+        if file_size == 0:
+            raise Exception("Screenshot file is empty")
+        if file_size > 50 * 1024 * 1024:  # 50MB limit
+            raise Exception("Screenshot file too large")
+        
+        # Resize if needed with input validation
         from PIL import Image
         with Image.open(screenshot_path) as img:
-            max_width = int(os.getenv('SCREENSHOT_MAX_WIDTH', '1024'))
+            # Security: validate environment variable input
+            max_width_str = os.getenv('SCREENSHOT_MAX_WIDTH', '1024')
+            try:
+                max_width = int(max_width_str)
+                if not (100 <= max_width <= 4096):  # Reasonable bounds
+                    raise ValueError("Max width out of bounds")
+            except ValueError:
+                print(f"Invalid SCREENSHOT_MAX_WIDTH: {max_width_str}, using default")
+                max_width = 1024
+                
             width, height = img.size
+            
+            # Security: validate image dimensions
+            if width <= 0 or height <= 0 or width > 10000 or height > 10000:
+                raise ValueError("Invalid image dimensions")
             
             if width > max_width:
                 ratio = max_width / width
                 new_width = max_width
                 new_height = int(height * ratio)
+                
+                # Security: validate new dimensions
+                if new_height <= 0 or new_height > 4096:
+                    raise ValueError("Invalid resized dimensions")
+                    
                 img = img.resize((new_width, new_height))
                 img.save(screenshot_path)
+        
+        # Security: validate final file before reading
+        final_size = os.path.getsize(screenshot_path)
+        if final_size == 0:
+            raise Exception("Processed screenshot is empty")
+        if final_size > 20 * 1024 * 1024:  # 20MB limit after processing
+            raise Exception("Processed screenshot too large")
         
         with open(screenshot_path, "rb") as image_file:
             base64_data = base64.b64encode(image_file.read()).decode('utf-8')
@@ -196,23 +254,47 @@ def capture_screenshot():
         return screenshot_path, base64_data
     except Exception as e:
         print(f"Error capturing screenshot: {e}")
+        # Clean up temporary file on error
+        try:
+            if 'screenshot_path' in locals() and os.path.exists(screenshot_path):
+                os.unlink(screenshot_path)
+        except:
+            pass
         return None, None
 
 def _process_llm_cmd(keyboard_controller, transcript):
     """Process transcript with Ollama and type the response."""
 
     try:
-        loading_indicator.show(message=f"Processing: {transcript}")
+        # Security: validate and sanitize transcript input
+        if not transcript or not isinstance(transcript, str):
+            raise ValueError("Invalid transcript input")
         
+        transcript = transcript.strip()
+        if len(transcript) > 1000:  # Reasonable limit for voice commands
+            raise ValueError("Transcript too long")
+        
+        if not transcript:  # Empty after strip
+            print("Empty transcript, skipping processing")
+            return None
+        
+        loading_indicator.show(message=f"Processing: {transcript[:50]}...")  # Limit displayed text
+        
+        # Security: validate environment variables
         model = os.getenv('OLLAMA_MODEL', 'gemma3:27b')
+        if not model or len(model) > 100:  # Reasonable model name length
+            print("Invalid OLLAMA_MODEL, using default")
+            model = 'gemma3:27b'
+        
         # Disable screenshots on macOS by default due to workspace limitations
-        include_screenshot = os.getenv('INCLUDE_SCREENSHOT', 'false').lower() == 'true'
+        include_screenshot_str = os.getenv('INCLUDE_SCREENSHOT', 'false').lower()
+        include_screenshot = include_screenshot_str in ('true', '1', 'yes', 'on')
         
         screenshot_path, screenshot_base64 = (None, None)
         if include_screenshot and SCREENSHOT_AVAILABLE:
             screenshot_path, screenshot_base64 = capture_screenshot()
         
-        user_prompt = transcript.strip()
+        user_prompt = transcript
         
         system_prompt = """You are a voice-controlled AI assistant. The user is talking to their computer using voice commands.
 Your responses will be directly typed into the user's keyboard at their cursor position, so:
@@ -223,44 +305,87 @@ Your responses will be directly typed into the user's keyboard at their cursor p
 5. If you see a screenshot, analyze it and use it to inform your response
 6. Never apologize for limitations or explain what you're doing"""
         
-        if screenshot_base64:
-            url = "http://localhost:11434/api/generate"
-            payload = {
-                "model": model,
-                "prompt": user_prompt,
-                "system": system_prompt,
-                "stream": True,
-                "images": [screenshot_base64]  # Pass base64 data directly without data URI prefix
-            }
-            print(f"Sending request with screenshot to model: {model}")
-        else:
-            url = "http://localhost:11434/api/generate"
-            payload = {
-                "model": model,
-                "prompt": user_prompt,
-                "system": system_prompt,
-                "stream": True
-            }
-            print(f"Sending text-only request")
+        # Security: use localhost URL and validate
+        base_url = "http://127.0.0.1:11434"  # Use localhost IP instead of hostname
+        url = f"{base_url}/api/generate"
         
-        response = requests.post(url, json=payload, stream=True)
-        response.raise_for_status()
+        # Security: validate payload size and content
+        payload = {
+            "model": model,
+            "prompt": user_prompt,
+            "system": system_prompt,
+            "stream": True
+        }
+        
+        if screenshot_base64:
+            # Security: validate base64 data
+            if len(screenshot_base64) > 50 * 1024 * 1024:  # 50MB limit
+                print("Screenshot too large, skipping")
+            else:
+                payload["images"] = [screenshot_base64]
+                print(f"Sending request with screenshot to model: {model}")
+        else:
+            print(f"Sending text-only request to model: {model}")
+        
+        # Security: add timeout and size limits
+        try:
+            response = requests.post(
+                url, 
+                json=payload, 
+                stream=True,
+                timeout=30,  # 30 second timeout
+                headers={
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'VibeVoice/1.0'
+                }
+            )
+            response.raise_for_status()
+        except requests.exceptions.Timeout:
+            raise Exception("Request timeout - Ollama server may be overloaded")
+        except requests.exceptions.ConnectionError:
+            raise Exception("Cannot connect to Ollama server")
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Request failed: {e}")
+        
+        # Security: limit response processing with size and time limits
+        total_response_size = 0
+        max_response_size = 10 * 1024  # 10KB limit for AI responses
         
         for line in response.iter_lines():
             if line:
-                data = line.decode('utf-8')
-                if data.startswith('{'):
-                    chunk = json.loads(data)
-                    if 'response' in chunk:
-                        chunk_text = chunk['response']
-                        print(f"Debug - received chunk: {repr(chunk_text)}")
-                        
-                        # Replace smart/curly quotes with standard apostrophes
-                        # U+2018 (') and U+2019 (') are both replaced with standard apostrophe (')
-                        normalized_text = chunk_text.replace('\u2019', "'").replace('\u2018', "'")
-                        
-                        keyboard_controller.type(normalized_text)
-                        loading_indicator.hide()
+                total_response_size += len(line)
+                if total_response_size > max_response_size:
+                    print("Response too large, truncating")
+                    break
+                    
+                try:
+                    data = line.decode('utf-8')
+                    if data.startswith('{'):
+                        chunk = json.loads(data)
+                        if 'response' in chunk:
+                            chunk_text = chunk['response']
+                            
+                            # Security: validate chunk content
+                            if not isinstance(chunk_text, str):
+                                continue
+                            if len(chunk_text) > 500:  # Limit individual chunks
+                                chunk_text = chunk_text[:500]
+                            
+                            print(f"Debug - received chunk: {repr(chunk_text[:50])}")
+                            
+                            # Replace smart/curly quotes with standard apostrophes
+                            # U+2018 (') and U+2019 (') are both replaced with standard apostrophe (')
+                            normalized_text = chunk_text.replace('\u2019', "'").replace('\u2018', "'")
+                            
+                            # Security: basic content filtering (remove control characters except newline/tab)
+                            import re
+                            normalized_text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', normalized_text)
+                            
+                            keyboard_controller.type(normalized_text)
+                            loading_indicator.hide()
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    print(f"Error processing response chunk: {e}")
+                    continue
         
         return "Successfully processed with Ollama"
     except requests.exceptions.RequestException as e:
