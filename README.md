@@ -61,6 +61,7 @@ python src/vibevoice/cli.py
 
 * Make sure that you have CUDA >= 12.4 and cuDNN >= 9.x
 * I had some trouble at first with Ubuntu 24.04, so I did the following:
+* Attention: DO NOT do this if your are a WSL user (https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
 
 ```bash
 sudo apt update && sudo apt upgrade
