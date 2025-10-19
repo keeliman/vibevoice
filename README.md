@@ -26,12 +26,24 @@ Works everywhere on your system and the LLM always has the screen context
 
 ## Installation 🛠️
 
+### Méthode recommandée (lancement automatique)
+```bash
+git clone https://github.com/mpaepper/vibevoice.git
+cd vibevoice
+python launch.py
+```
+
+### Méthode manuelle
 ```bash
 git clone https://github.com/mpaepper/vibevoice.git
 cd vibevoice
 pip install -r requirements.txt
 python src/vibevoice/cli.py
 ```
+
+### Scripts utilitaires
+- `python launch.py` - Lancement automatique avec vérifications
+- `python cleanup.py` - Nettoyage des processus bloqués
 
 ## Requirements 📋
 
@@ -84,14 +96,25 @@ sudo apt install cudnn9-cuda-12
 
 ## Usage 💡
 
-1. Start the application:
+### Lancement rapide
+```bash
+python launch.py
+```
+
+### Lancement manuel
 ```bash
 python src/vibevoice/cli.py
 ```
 
-2. Hold down right control key (Ctrl_r) while speaking
-3. Release to transcribe
-4. Your text appears wherever your cursor is!
+### Nettoyage en cas de problème
+```bash
+python cleanup.py
+```
+
+### Utilisation
+1. Hold down right control key (Ctrl_r) while speaking
+2. Release to transcribe
+3. Your text appears wherever your cursor is!
 
 ### Configuration
 

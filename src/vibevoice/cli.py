@@ -151,14 +151,53 @@ visual_indicator = VisualIndicator()
 
 def start_whisper_server():
     server_script = os.path.join(os.path.dirname(__file__), 'server.py')
-    process = subprocess.Popen(['python3', server_script])
+    process = subprocess.Popen(['python3', server_script], 
+                              stdout=subprocess.PIPE, 
+                              stderr=subprocess.PIPE,
+                              text=True)
     return process
 
-def wait_for_server(timeout=1800, interval=0.5):
+def find_server_port(process, timeout=30):
+    """Détecte le port du serveur en lisant sa sortie"""
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = requests.get('http://localhost:4242/health')
+            # Lire la sortie du processus pour détecter le port
+            if process.poll() is not None:
+                # Le processus s'est terminé
+                stderr = process.stderr.read()
+                raise RuntimeError(f"Le serveur s'est arrêté: {stderr}")
+            
+            # Vérifier si on peut lire la sortie
+            if process.stdout.readable():
+                line = process.stdout.readline()
+                if line and "Démarrage du serveur sur le port" in line:
+                    # Extraire le numéro de port
+                    import re
+                    match = re.search(r'port (\d+)', line)
+                    if match:
+                        return int(match.group(1))
+        except Exception as e:
+            print(f"Erreur lors de la détection du port: {e}")
+        
+        time.sleep(0.1)
+    
+    # Fallback: essayer les ports par défaut
+    for port in range(4242, 4252):
+        try:
+            response = requests.get(f'http://localhost:{port}/health', timeout=1)
+            if response.status_code == 200:
+                return port
+        except requests.exceptions.RequestException:
+            pass
+    
+    raise TimeoutError("Impossible de détecter le port du serveur")
+
+def wait_for_server(port, timeout=30, interval=0.5):
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(f'http://localhost:{port}/health')
             if response.status_code == 200:
                 return True
         except requests.exceptions.RequestException:
@@ -410,7 +449,47 @@ Your responses will be directly typed into the user's keyboard at their cursor p
     finally:
         loading_indicator.hide()
 
+def check_dependencies():
+    """Vérifie que toutes les dépendances sont disponibles"""
+    missing_deps = []
+    
+    try:
+        import sounddevice as sd
+        # Vérifier que l'audio est disponible
+        devices = sd.query_devices()
+        if not devices:
+            missing_deps.append("Aucun périphérique audio détecté")
+    except ImportError:
+        missing_deps.append("sounddevice")
+    except Exception as e:
+        missing_deps.append(f"Erreur audio: {e}")
+    
+    try:
+        import requests
+    except ImportError:
+        missing_deps.append("requests")
+    
+    try:
+        import numpy as np
+    except ImportError:
+        missing_deps.append("numpy")
+    
+    if missing_deps:
+        print("❌ Dépendances manquantes:")
+        for dep in missing_deps:
+            print(f"   - {dep}")
+        print("\n💡 Installez les dépendances avec: pip install -r requirements.txt")
+        return False
+    
+    return True
+
 def main():
+    print("🚀 Démarrage de VibeVoice...")
+    
+    # Vérifications préliminaires
+    if not check_dependencies():
+        sys.exit(1)
+    
     load_dotenv()
     key_label = os.environ.get("VOICEKEY", "cmd_r")
     cmd_label = os.environ.get("VOICEKEY_CMD", "f12")
@@ -425,6 +504,7 @@ def main():
     audio_data = []
     sample_rate = 16000
     keyboard_controller = KeyboardController()
+    server_port = None  # Sera défini lors du démarrage du serveur
 
     def on_press(key):
         nonlocal recording, audio_data
@@ -451,7 +531,7 @@ def main():
             print(f"\n📷 Started {mode} recording (with context)...")
 
     def on_release(key):
-        nonlocal recording, processing, audio_data
+        nonlocal recording, processing, audio_data, server_port
         if key == RECORD_KEY or key == CMD_KEY or key == SCREENSHOT_CMD_KEY:
             if not recording or processing:
                 return  # Already processed or not recording
@@ -481,7 +561,7 @@ def main():
             wavfile.write(recording_path, sample_rate, audio_data_int16)
 
             try:
-                response = requests.post('http://localhost:4242/transcribe/', 
+                response = requests.post(f'http://localhost:{server_port}/transcribe/', 
                                       json={'file_path': recording_path})
                 response.raise_for_status()
                 transcript = response.json()['text']
@@ -498,10 +578,11 @@ def main():
                     success = _process_llm_cmd(keyboard_controller, transcript, force_screenshot=True)
                     notification_manager.ai_processing_complete(success is not None)
             except requests.exceptions.RequestException as e:
-                print(f"Error sending request to local API: {e}")
+                print(f"❌ Erreur lors de l'envoi de la requête à l'API locale: {e}")
+                print(f"💡 Vérifiez que le serveur fonctionne sur le port {server_port}")
                 notification_manager.transcription_error(str(e))
             except Exception as e:
-                print(f"Error processing transcript: {e}")
+                print(f"❌ Erreur lors du traitement de la transcription: {e}")
                 notification_manager.transcription_error(str(e))
             finally:
                 processing = False  # Reset processing flag
@@ -515,8 +596,15 @@ def main():
     server_process = start_whisper_server()
     
     try:
-        print(f"Waiting for the server to be ready...")
-        wait_for_server()
+        print(f"🔍 Détection du port du serveur...")
+        server_port = find_server_port(server_process)
+        print(f"✅ Serveur détecté sur le port {server_port}")
+        
+        # Mettre à jour la variable dans la portée de main
+        globals()['server_port'] = server_port
+        
+        print(f"⏳ Attente que le serveur soit prêt...")
+        wait_for_server(server_port)
         notification_manager.server_ready()
         print(f"\n🎉 VIBEVOICE IS ACTIVE! 🎉")
         print(f"🎙️  Dictation: Hold down {key_label} (⌘ droite)")
@@ -530,14 +618,24 @@ def main():
             with sd.InputStream(callback=callback, channels=1, samplerate=sample_rate):
                 listener.join()
     except TimeoutError as e:
-        print(f"Error: {e}")
+        print(f"❌ Erreur de timeout: {e}")
+        print("💡 Le serveur n'a pas pu démarrer dans les temps. Vérifiez les ports disponibles.")
+        notification_manager.server_error()
+        server_process.terminate()
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"❌ Erreur du serveur: {e}")
+        print("💡 Vérifiez que toutes les dépendances sont installées correctement.")
         notification_manager.server_error()
         server_process.terminate()
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\n🛑 Arrêt en cours...")
     finally:
-        server_process.terminate()
+        if server_process.poll() is None:
+            print("🔄 Arrêt du serveur...")
+            server_process.terminate()
+            server_process.wait(timeout=5)
 
 if __name__ == "__main__":
     main()

@@ -1,10 +1,11 @@
 """FastAPI server for Whisper transcription"""
 
 import os
+import socket
 import uvicorn
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from faster_whisper import WhisperModel
 
 app = FastAPI()
@@ -47,7 +48,8 @@ def validate_file_path(file_path: str) -> Path:
 class TranscribeRequest(BaseModel):
     file_path: str
     
-    @validator('file_path')
+    @field_validator('file_path')
+    @classmethod
     def validate_file_path_input(cls, v):
         # Basic validation - detailed validation happens in endpoint
         if not v or not isinstance(v, str):
@@ -80,9 +82,22 @@ async def transcribe(request: TranscribeRequest):
         print(f"Transcription error: {e}")
         raise HTTPException(status_code=500, detail="Internal transcription error")
 
+def find_available_port(start_port=4242, max_attempts=10):
+    """Trouve un port disponible en commençant par start_port"""
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(f"Aucun port disponible trouvé entre {start_port} et {start_port + max_attempts - 1}")
+
 def run_server():
     # Security: bind to localhost only to prevent network exposure
-    uvicorn.run(app, host="127.0.0.1", port=4242)
+    port = find_available_port()
+    print(f"🚀 Démarrage du serveur sur le port {port}")
+    uvicorn.run(app, host="127.0.0.1", port=port)
 
 if __name__ == "__main__":
     run_server()
