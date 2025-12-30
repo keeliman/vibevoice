@@ -171,3 +171,24 @@ VibeVoice supports two modes:
 - Original inspiration: [whisper-keyboard](https://github.com/vlad-ds/whisper-keyboard) by Vlad
 - [Faster Whisper](https://github.com/guillaumekln/faster-whisper) for the optimized Whisper implementation
 - Built by [Marc Päpper](https://www.paepper.com)
+
+## Troubleshooting 🔧
+
+### Keyboard shortcuts not working on macOS
+
+If keyboard shortcuts (like ⌘ Command) are not being detected:
+
+**Important**: Run VibeVoice from an **external Terminal** app, NOT from within an editor like VS Code, Conductor, or similar. These editors intercept keyboard shortcuts before VibeVoice can detect them.
+
+1. Open the macOS **Terminal** app (Spotlight → Terminal)
+2. Navigate to the vibevoice directory
+3. Run `python launch.py` or `python src/vibevoice/cli.py`
+
+### macOS Accessibility Permissions
+
+If you still don't hear the sound notification when pressing hotkeys:
+
+1. **Système → Réglages → Confidentialité et sécurité → Accessibilité**
+2. Find **Terminal** (or Python) in the list - NOT your editor
+3. Enable the permission
+4. Restart VibeVoice

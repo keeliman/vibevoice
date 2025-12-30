@@ -8,9 +8,16 @@ import subprocess
 import sys
 import time
 
+# Import configuration
+try:
+    from src.vibevoice.config import ALL_PORTS
+except ImportError:
+    # Fallback if import fails
+    ALL_PORTS = list(range(4242, 4252))
+
 def kill_processes_on_ports():
     """Tue les processus sur les ports utilisés par VibeVoice"""
-    ports = [4242, 4243, 4244, 4245, 4246, 4247, 4248, 4249, 4250, 4251]
+    ports = ALL_PORTS
     
     for port in ports:
         try:

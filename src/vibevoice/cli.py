@@ -1,9 +1,18 @@
 """Command-line interface for vibevoice"""
 
+import sys
+
+# IMPORTANT: Ensure src directory is in PythonPath before any imports
+import os as _os_module
+_src_dir = _os_module.path.join(_os_module.path.dirname(__file__), '..')
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
 import os
 import subprocess
 import time
 import json
+import re
 import sounddevice as sd
 import numpy as np
 import requests
@@ -23,19 +32,51 @@ from pynput.keyboard import Controller as KeyboardController, Key, Listener, Key
 from scipy.io import wavfile
 from dotenv import load_dotenv
 
-try:
+# Handle different execution environments (PyInstaller, module, script)
+import sys as _sys
+import os
+
+def _init_imports():
+    """Initialize imports based on execution context"""
+    global loading_indicator, notification_manager, config
+
+    # PyInstaller bundle: use Resources path
+    if getattr(_sys, 'frozen', False):
+        resources_path = os.path.join(_sys._MEIPASS, 'Resources')
+        if resources_path not in _sys.path:
+            _sys.path.insert(0, resources_path)
+        # Force absolute imports for PyInstaller
+        from vibevoice.loading_indicator import LoadingIndicator
+        from vibevoice.notifications import NotificationManager
+        import vibevoice.config as config
+        return LoadingIndicator, NotificationManager, config
+
     # Try relative imports first (when run as module)
-    from .loading_indicator import LoadingIndicator
-    from .notifications import NotificationManager
+    try:
+        from .loading_indicator import LoadingIndicator
+        from .notifications import NotificationManager
+        from . import config
+        return LoadingIndicator, NotificationManager, config
+    except ImportError:
+        # Fall back to absolute imports (when run as script)
+        from loading_indicator import LoadingIndicator
+        from notifications import NotificationManager
+        import vibevoice.config as config
+        return LoadingIndicator, NotificationManager, config
+
+# Initialize imports - need to instantiate the classes
+LoadingIndicatorClass, NotificationManagerClass, config = _init_imports()
+loading_indicator = LoadingIndicatorClass()
+notification_manager = NotificationManagerClass()
+
+# Import control state for pause functionality
+try:
+    from .control_state import is_paused, set_running
 except ImportError:
-    # Fall back to absolute imports (when run as script)
-    from loading_indicator import LoadingIndicator
-    from notifications import NotificationManager
+    from vibevoice.control_state import is_paused, set_running
+
 import threading
 import pygame
-
-loading_indicator = LoadingIndicator()
-notification_manager = NotificationManager()
 
 # Initialize pygame for audio feedback (legacy support)
 try:
@@ -68,7 +109,6 @@ class VisualIndicator:
             
     def _recording_animation(self, mode):
         """Animated recording indicator"""
-        import time
         colors = {
             "dictation": "\033[92m",  # Green
             "command": "\033[94m",    # Blue
@@ -91,59 +131,75 @@ class VisualIndicator:
             icon_index += 1
         print(" " * 50, end="\r")  # Clear the line
 
+# Cached sound objects to avoid regenerating audio waves
+_SOUND_CACHE = {}
+
+def _generate_sound(sound_type: str) -> np.ndarray:
+    """Generate audio wave for caching (internal function)"""
+    sample_rate = 44100
+    duration = 0.15
+
+    if sound_type == "start":
+        # Modern "ding" sound - ascending chord
+        t = np.linspace(0, duration, int(sample_rate * duration))
+
+        # Create a pleasant ascending chord (C major triad)
+        wave1 = np.sin(2 * np.pi * 523.25 * t)  # C5
+        wave2 = np.sin(2 * np.pi * 659.25 * t)  # E5
+        wave3 = np.sin(2 * np.pi * 783.99 * t)  # G5
+
+        # Blend the waves with fade in/out
+        fade_samples = int(0.05 * sample_rate)
+        fade_in = np.linspace(0, 1, fade_samples)
+        fade_out = np.linspace(1, 0, fade_samples)
+
+        wave = (wave1 + wave2 + wave3) / 3
+        wave[:fade_samples] *= fade_in
+        wave[-fade_samples:] *= fade_out
+
+        # Normalize and convert
+        return (wave * 0.3 * 32767).astype(np.int16)
+
+    elif sound_type == "stop":
+        # Modern "dong" sound - descending chord
+        t = np.linspace(0, duration, int(sample_rate * duration))
+
+        # Create a pleasant descending chord (F major triad)
+        wave1 = np.sin(2 * np.pi * 349.23 * t)  # F4
+        wave2 = np.sin(2 * np.pi * 440.00 * t)  # A4
+        wave3 = np.sin(2 * np.pi * 523.25 * t)  # C5
+
+        # Blend the waves with fade in/out
+        fade_samples = int(0.05 * sample_rate)
+        fade_in = np.linspace(0, 1, fade_samples)
+        fade_out = np.linspace(1, 0, fade_samples)
+
+        wave = (wave1 + wave2 + wave3) / 3
+        wave[:fade_samples] *= fade_in
+        wave[-fade_samples:] *= fade_out
+
+        # Normalize and convert
+        return (wave * 0.3 * 32767).astype(np.int16)
+
+    return None
+
 def play_sound(sound_type):
-    """Play audio feedback with modern, pleasant sounds"""
+    """Play audio feedback with modern, pleasant sounds (cached)"""
     if not AUDIO_AVAILABLE:
         return
-        
+
     try:
-        sample_rate = 44100
-        duration = 0.15
-        
-        if sound_type == "start":
-            # Modern "ding" sound - ascending chord
-            t = np.linspace(0, duration, int(sample_rate * duration))
-            
-            # Create a pleasant ascending chord (C major triad)
-            wave1 = np.sin(2 * np.pi * 523.25 * t)  # C5
-            wave2 = np.sin(2 * np.pi * 659.25 * t)  # E5  
-            wave3 = np.sin(2 * np.pi * 783.99 * t)  # G5
-            
-            # Blend the waves with fade in/out
-            fade_samples = int(0.05 * sample_rate)
-            fade_in = np.linspace(0, 1, fade_samples)
-            fade_out = np.linspace(1, 0, fade_samples)
-            
-            wave = (wave1 + wave2 + wave3) / 3
-            wave[:fade_samples] *= fade_in
-            wave[-fade_samples:] *= fade_out
-            
-            # Normalize and convert
-            wave = (wave * 0.3 * 32767).astype(np.int16)
-            
-        elif sound_type == "stop":
-            # Modern "dong" sound - descending chord
-            t = np.linspace(0, duration, int(sample_rate * duration))
-            
-            # Create a pleasant descending chord (F major triad)
-            wave1 = np.sin(2 * np.pi * 349.23 * t)  # F4
-            wave2 = np.sin(2 * np.pi * 440.00 * t)  # A4
-            wave3 = np.sin(2 * np.pi * 523.25 * t)  # C5
-            
-            # Blend the waves with fade in/out
-            fade_samples = int(0.05 * sample_rate)
-            fade_in = np.linspace(0, 1, fade_samples)
-            fade_out = np.linspace(1, 0, fade_samples)
-            
-            wave = (wave1 + wave2 + wave3) / 3
-            wave[:fade_samples] *= fade_in
-            wave[-fade_samples:] *= fade_out
-            
-            # Normalize and convert
-            wave = (wave * 0.3 * 32767).astype(np.int16)
-        
-        pygame.mixer.Sound(wave).play()
-        
+        # Check cache first
+        if sound_type not in _SOUND_CACHE:
+            wave = _generate_sound(sound_type)
+            if wave is not None:
+                _SOUND_CACHE[sound_type] = pygame.mixer.Sound(wave)
+            else:
+                return
+
+        # Play cached sound
+        _SOUND_CACHE[sound_type].play()
+
     except Exception as e:
         print(f"Audio error: {e}")
 
@@ -151,53 +207,54 @@ visual_indicator = VisualIndicator()
 
 def start_whisper_server():
     server_script = os.path.join(os.path.dirname(__file__), 'server.py')
-    process = subprocess.Popen(['python3', server_script], 
-                              stdout=subprocess.PIPE, 
-                              stderr=subprocess.PIPE,
-                              text=True)
+    # Set up environment with correct PYTHONPATH
+    env = os.environ.copy()
+    # Ensure the src directory is in PYTHONPATH
+    src_dir = os.path.dirname(os.path.dirname(__file__))
+    if 'PYTHONPATH' in env:
+        env['PYTHONPATH'] = src_dir + os.pathsep + env['PYTHONPATH']
+    else:
+        env['PYTHONPATH'] = src_dir
+
+    # Use same Python interpreter and proper environment
+    process = subprocess.Popen([_sys.executable, server_script],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL,
+                              env=env)
     return process
 
-def find_server_port(process, timeout=30):
-    """Détecte le port du serveur en lisant sa sortie"""
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+def find_server_port(process, timeout=None):
+    """Détecte le port du serveur en scannant les ports (méthode fiable)"""
+    import time
+    import requests
+
+    # Give server time to start
+    time.sleep(1.5)
+
+    # Check if process is still running
+    if process.poll() is not None:
+        raise RuntimeError("Le serveur s'est arrêté prématurément")
+
+    # Scan ports to find the server
+    for port in range(config.FALLBACK_PORTS_START, config.FALLBACK_PORTS_END):
         try:
-            # Lire la sortie du processus pour détecter le port
-            if process.poll() is not None:
-                # Le processus s'est terminé
-                stderr = process.stderr.read()
-                raise RuntimeError(f"Le serveur s'est arrêté: {stderr}")
-            
-            # Vérifier si on peut lire la sortie
-            if process.stdout.readable():
-                line = process.stdout.readline()
-                if line and "Démarrage du serveur sur le port" in line:
-                    # Extraire le numéro de port
-                    import re
-                    match = re.search(r'port (\d+)', line)
-                    if match:
-                        return int(match.group(1))
-        except Exception as e:
-            print(f"Erreur lors de la détection du port: {e}")
-        
-        time.sleep(0.1)
-    
-    # Fallback: essayer les ports par défaut
-    for port in range(4242, 4252):
-        try:
-            response = requests.get(f'http://localhost:{port}/health', timeout=1)
+            response = requests.get(f'http://{config.SERVER_HOST}:{port}/health', timeout=0.5)
             if response.status_code == 200:
                 return port
         except requests.exceptions.RequestException:
-            pass
-    
+            continue
+
     raise TimeoutError("Impossible de détecter le port du serveur")
 
-def wait_for_server(port, timeout=30, interval=0.5):
+def wait_for_server(port, timeout=None, interval=None):
+    if timeout is None:
+        timeout = config.HEALTH_CHECK_TIMEOUT
+    if interval is None:
+        interval = config.HEALTH_CHECK_INTERVAL
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = requests.get(f'http://localhost:{port}/health')
+            response = requests.get(f'http://{config.SERVER_HOST}:{port}/health')
             if response.status_code == 200:
                 return True
         except requests.exceptions.RequestException:
@@ -210,29 +267,27 @@ def capture_screenshot():
     if not SCREENSHOT_AVAILABLE:
         print("Screenshot functionality not available. Install Pillow with: pip install Pillow")
         return None, None
-        
+
     try:
         import tempfile
-        import shlex
-        
+
         # Security: use secure temporary file instead of predictable name
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False, prefix='vibevoice_screenshot_') as temp_file:
             screenshot_path = temp_file.name
-        
+
         print(f"Capturing screenshot to: {screenshot_path}")
-        
+
         # Security: validate screenshot path is in temp directory
         if not screenshot_path.startswith(tempfile.gettempdir()):
             raise ValueError("Screenshot path outside temporary directory")
-        
+
         # Try using macOS native screenshot command first
         try:
-            import subprocess
             # Security: use absolute path to screencapture and properly escape filename
             screencapture_path = '/usr/sbin/screencapture'
             if not os.path.exists(screencapture_path):
                 raise Exception("screencapture command not found")
-                
+
             result = subprocess.run([
                 screencapture_path, '-x', screenshot_path
             ], capture_output=True, text=True, timeout=5)
@@ -250,49 +305,49 @@ def capture_screenshot():
         # Security: validate file was created and is reasonable size
         if not os.path.exists(screenshot_path):
             raise Exception("Screenshot file was not created")
-            
+
         file_size = os.path.getsize(screenshot_path)
         if file_size == 0:
             raise Exception("Screenshot file is empty")
-        if file_size > 50 * 1024 * 1024:  # 50MB limit
+        if file_size > config.MAX_SCREENSHOT_SIZE_RAW:
             raise Exception("Screenshot file too large")
-        
+
         # Resize if needed with input validation
         from PIL import Image
         with Image.open(screenshot_path) as img:
             # Security: validate environment variable input
-            max_width_str = os.getenv('SCREENSHOT_MAX_WIDTH', '1024')
+            max_width_str = os.getenv('SCREENSHOT_MAX_WIDTH', str(config.SCREENSHOT_DEFAULT_MAX_WIDTH))
             try:
                 max_width = int(max_width_str)
-                if not (100 <= max_width <= 4096):  # Reasonable bounds
+                if not (config.SCREENSHOT_MIN_WIDTH <= max_width <= config.SCREENSHOT_MAX_WIDTH):
                     raise ValueError("Max width out of bounds")
             except ValueError:
                 print(f"Invalid SCREENSHOT_MAX_WIDTH: {max_width_str}, using default")
-                max_width = 1024
-                
+                max_width = config.SCREENSHOT_DEFAULT_MAX_WIDTH
+
             width, height = img.size
-            
+
             # Security: validate image dimensions
             if width <= 0 or height <= 0 or width > 10000 or height > 10000:
                 raise ValueError("Invalid image dimensions")
-            
+
             if width > max_width:
                 ratio = max_width / width
                 new_width = max_width
                 new_height = int(height * ratio)
-                
+
                 # Security: validate new dimensions
-                if new_height <= 0 or new_height > 4096:
+                if new_height <= 0 or new_height > config.SCREENSHOT_MAX_HEIGHT:
                     raise ValueError("Invalid resized dimensions")
-                    
+
                 img = img.resize((new_width, new_height))
                 img.save(screenshot_path)
-        
+
         # Security: validate final file before reading
         final_size = os.path.getsize(screenshot_path)
         if final_size == 0:
             raise Exception("Processed screenshot is empty")
-        if final_size > 20 * 1024 * 1024:  # 20MB limit after processing
+        if final_size > config.MAX_SCREENSHOT_SIZE_PROCESSED:
             raise Exception("Processed screenshot too large")
         
         with open(screenshot_path, "rb") as image_file:
@@ -318,20 +373,20 @@ def _process_llm_cmd(keyboard_controller, transcript, force_screenshot=False):
             raise ValueError("Invalid transcript input")
         
         transcript = transcript.strip()
-        if len(transcript) > 1000:  # Reasonable limit for voice commands
+        if len(transcript) > config.MAX_TRANSCRIPT_LENGTH:
             raise ValueError("Transcript too long")
         
         if not transcript:  # Empty after strip
             print("Empty transcript, skipping processing")
             return None
-        
+
         loading_indicator.show(message=f"Processing: {transcript[:50]}...")  # Limit displayed text
-        
+
         # Security: validate environment variables
-        model = os.getenv('OLLAMA_MODEL', 'gemma3:27b')
+        model = os.getenv('OLLAMA_MODEL', config.OLLAMA_DEFAULT_MODEL)
         if not model or len(model) > 100:  # Reasonable model name length
             print("Invalid OLLAMA_MODEL, using default")
-            model = 'gemma3:27b'
+            model = config.OLLAMA_DEFAULT_MODEL
         
         # Screenshot logic: force for screenshot mode, or check env var
         if force_screenshot:
@@ -356,11 +411,11 @@ Your responses will be directly typed into the user's keyboard at their cursor p
 4. Don't include formatting like bullet points, which might look strange when typed
 5. If you see a screenshot, analyze it and use it to inform your response
 6. Never apologize for limitations or explain what you're doing"""
-        
+
         # Security: use localhost URL and validate
-        base_url = "http://127.0.0.1:11434"  # Use localhost IP instead of hostname
+        base_url = config.OLLAMA_BASE_URL
         url = f"{base_url}/api/generate"
-        
+
         # Security: validate payload size and content
         payload = {
             "model": model,
@@ -368,23 +423,23 @@ Your responses will be directly typed into the user's keyboard at their cursor p
             "system": system_prompt,
             "stream": True
         }
-        
+
         if screenshot_base64:
             # Security: validate base64 data
-            if len(screenshot_base64) > 50 * 1024 * 1024:  # 50MB limit
+            if len(screenshot_base64) > config.MAX_SCREENSHOT_BASE64_SIZE:
                 print("Screenshot too large, skipping")
             else:
                 payload["images"] = [screenshot_base64]
                 print(f"Sending request with screenshot to model: {model}")
         else:
             print(f"Sending text-only request to model: {model}")
-        
+
         # Security: add timeout and size limits (longer timeout for screenshots)
-        timeout_seconds = 60 if screenshot_base64 else 30  # 60s for screenshots, 30s for text
+        timeout_seconds = config.REQUEST_TIMEOUT_SCREENSHOT if screenshot_base64 else config.REQUEST_TIMEOUT_TEXT
         try:
             response = requests.post(
-                url, 
-                json=payload, 
+                url,
+                json=payload,
                 stream=True,
                 timeout=timeout_seconds,
                 headers={
@@ -402,39 +457,38 @@ Your responses will be directly typed into the user's keyboard at their cursor p
             raise Exception("Cannot connect to Ollama server. Make sure Ollama is running.")
         except requests.exceptions.RequestException as e:
             raise Exception(f"Request failed: {e}")
-        
+
         # Security: limit response processing with size and time limits
         total_response_size = 0
-        max_response_size = 10 * 1024  # 10KB limit for AI responses
-        
+        max_response_size = config.MAX_AI_RESPONSE_SIZE
+
         for line in response.iter_lines():
             if line:
                 total_response_size += len(line)
                 if total_response_size > max_response_size:
                     print("Response too large, truncating")
                     break
-                    
+
                 try:
                     data = line.decode('utf-8')
                     if data.startswith('{'):
                         chunk = json.loads(data)
                         if 'response' in chunk:
                             chunk_text = chunk['response']
-                            
+
                             # Security: validate chunk content
                             if not isinstance(chunk_text, str):
                                 continue
-                            if len(chunk_text) > 500:  # Limit individual chunks
-                                chunk_text = chunk_text[:500]
+                            if len(chunk_text) > config.MAX_AI_CHUNK_SIZE:
+                                chunk_text = chunk_text[:config.MAX_AI_CHUNK_SIZE]
                             
                             print(f"Debug - received chunk: {repr(chunk_text[:50])}")
                             
                             # Replace smart/curly quotes with standard apostrophes
                             # U+2018 (') and U+2019 (') are both replaced with standard apostrophe (')
                             normalized_text = chunk_text.replace('\u2019', "'").replace('\u2018', "'")
-                            
+
                             # Security: basic content filtering (remove control characters except newline/tab)
-                            import re
                             normalized_text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', normalized_text)
                             
                             keyboard_controller.type(normalized_text)
@@ -484,37 +538,55 @@ def check_dependencies():
     return True
 
 def main():
-    print("🚀 Démarrage de VibeVoice...")
-    
+    print("🚀 Démarrage de VibeVoice...", flush=True)
+
+    # Set running state for menubar
+    set_running(True)
+    print("✓ Control state set", flush=True)
+
     # Vérifications préliminaires
+    print("Checking dependencies...", flush=True)
     if not check_dependencies():
         sys.exit(1)
-    
+    print("✓ Dependencies OK", flush=True)
+
+    print("Loading dotenv...", flush=True)
     load_dotenv()
+    print("✓ Dotenv loaded", flush=True)
+
+    print("Setting up keys...", flush=True)
     key_label = os.environ.get("VOICEKEY", "cmd_r")
     cmd_label = os.environ.get("VOICEKEY_CMD", "f12")
     screenshot_cmd_label = os.environ.get("VOICEKEY_SCREENSHOT", "alt_r")
+    print(f"✓ Keys: {key_label}, {cmd_label}, {screenshot_cmd_label}", flush=True)
+
+    print("Creating Key objects...", flush=True)
     RECORD_KEY = Key[key_label]
     CMD_KEY = Key[cmd_label]
     SCREENSHOT_CMD_KEY = Key[screenshot_cmd_label]
-#    CMD_KEY = KeyCode(vk=65027)  # This is how you can use non-standard keys, this is AltGr for me
+    print("✓ Key objects created", flush=True)
 
     recording = False
     processing = False  # Prevent double processing
     audio_data = []
-    sample_rate = 16000
+    sample_rate = config.SAMPLE_RATE
     keyboard_controller = KeyboardController()
     server_port = None  # Sera défini lors du démarrage du serveur
+    print("✓ Variables initialized", flush=True)
 
     def on_press(key):
         nonlocal recording, audio_data
+        # Check if paused - if so, ignore hotkeys
+        if is_paused():
+            return
+
         if key == RECORD_KEY and not recording:
             recording = True
             audio_data = []
             mode = "dictation"
             visual_indicator.show_recording(mode)
             notification_manager.recording_started(mode)
-            print(f"\n🎙️  Started {mode} recording...")
+            print(f"\n🎙️  Started {mode} recording...", flush=True)
         elif key == CMD_KEY and not recording:
             recording = True
             audio_data = []
@@ -593,20 +665,24 @@ def main():
         if recording:
             audio_data.append(indata.copy())
 
+    print("Starting server...", flush=True)
     server_process = start_whisper_server()
-    
+    print(f"✓ Server PID: {server_process.pid}", flush=True)
+
     try:
-        print(f"🔍 Détection du port du serveur...")
+        print(f"🔍 Détection du port du serveur...", flush=True)
         server_port = find_server_port(server_process)
-        print(f"✅ Serveur détecté sur le port {server_port}")
-        
-        # Mettre à jour la variable dans la portée de main
-        globals()['server_port'] = server_port
-        
-        print(f"⏳ Attente que le serveur soit prêt...")
+        print(f"✅ Serveur détecté sur le port {server_port}", flush=True)
+
+        print(f"⏳ Attente que le serveur soit prêt...", flush=True)
         wait_for_server(server_port)
+        print("✓ Server ready!", flush=True)
+
+        print("Calling server_ready notification...", flush=True)
         notification_manager.server_ready()
-        print(f"\n🎉 VIBEVOICE IS ACTIVE! 🎉")
+        print("✓ Notification sent", flush=True)
+
+        print(f"\n🎉 VIBEVOICE IS ACTIVE! 🎉", flush=True)
         print(f"🎙️  Dictation: Hold down {key_label} (⌘ droite)")
         print(f"🤖 AI Commands: Hold down {cmd_label} (F12)")
         print(f"📷 AI with Screenshot: Hold down {screenshot_cmd_label} (Option droite)")
@@ -632,6 +708,8 @@ def main():
     except KeyboardInterrupt:
         print("\n🛑 Arrêt en cours...")
     finally:
+        # Set running state to False
+        set_running(False)
         if server_process.poll() is None:
             print("🔄 Arrêt du serveur...")
             server_process.terminate()

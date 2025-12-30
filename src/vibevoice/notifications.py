@@ -13,36 +13,50 @@ except ImportError:
     CHIME_AVAILABLE = False
     print("Chime not available. Install with: pip install chime")
 
-# Visual notifications  
-try:
-    from desktop_notifier import DesktopNotifier
-    DESKTOP_NOTIFIER_AVAILABLE = True
-except ImportError:
+# Visual notifications
+# Disabled on macOS due to permission issues blocking startup
+import sys
+if sys.platform == "darwin":
     DESKTOP_NOTIFIER_AVAILABLE = False
-    print("Desktop notifier not available. Install with: pip install desktop-notifier")
+    DesktopNotifier = None
+else:
+    try:
+        from desktop_notifier import DesktopNotifier
+        DESKTOP_NOTIFIER_AVAILABLE = True
+    except ImportError:
+        DESKTOP_NOTIFIER_AVAILABLE = False
+        print("Desktop notifier not available. Install with: pip install desktop-notifier")
 
 class NotificationManager:
     """Elegant notification manager combining sound and visual notifications"""
-    
+
     def __init__(self):
         self.sound_enabled = CHIME_AVAILABLE
         self.visual_enabled = DESKTOP_NOTIFIER_AVAILABLE
-        
+        self._event_loop = None  # Cached event loop for sync notifications
+        self.desktop_notifier = None
+
         if self.sound_enabled:
             # Set chime theme to elegant sounds (use default theme)
             pass  # chime uses default theme which is suitable
-        
+
         if self.visual_enabled:
-            self.desktop_notifier = DesktopNotifier(
-                app_name="VibeVoice",
-                app_icon=None  # Can be set to an icon path if needed
-            )
+            try:
+                self.desktop_notifier = DesktopNotifier(
+                    app_name="VibeVoice",
+                    app_icon=None  # Can be set to an icon path if needed
+                )
+            except Exception as e:
+                # DesktopNotifier may fail due to permissions on macOS
+                print(f"Desktop notifier initialization failed: {e}")
+                print("Visual notifications disabled")
+                self.visual_enabled = False
     
     def play_sound(self, sound_type: Literal["success", "error", "warning", "info"]):
         """Play elegant notification sound"""
         if not self.sound_enabled:
             return
-            
+
         try:
             if sound_type == "success":
                 chime.success()
@@ -85,17 +99,50 @@ class NotificationManager:
         notification_type: Literal["success", "error", "warning", "info"] = "info",
         timeout: int = 5
     ):
-        """Synchronous wrapper for visual notifications"""
+        """Synchronous wrapper for visual notifications (optimized with cached loop)"""
+        if not self.visual_enabled:
+            print(f"[{notification_type.upper()}] {title}: {message}")
+            return
+
         try:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(
-                self.show_notification(title, message, notification_type, timeout)
-            )
-        except RuntimeError:
-            # If no event loop is running, create one
-            asyncio.run(
-                self.show_notification(title, message, notification_type, timeout)
-            )
+            # Try to use existing running loop
+            try:
+                loop = asyncio.get_running_loop()
+                # If we're here, there's a running loop - schedule as task
+                import threading
+                result = [None]
+                exception = [None]
+
+                def run_in_thread():
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            result[0] = new_loop.run_until_complete(
+                                self.show_notification(title, message, notification_type, timeout)
+                            )
+                        finally:
+                            new_loop.close()
+                    except Exception as e:
+                        exception[0] = e
+
+                thread = threading.Thread(target=run_in_thread, daemon=True)
+                thread.start()
+                thread.join(timeout=timeout + 1)
+                if exception[0]:
+                    raise exception[0]
+            except RuntimeError:
+                # No running loop, try to get or create cached loop
+                if self._event_loop is None or self._event_loop.is_closed():
+                    self._event_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(self._event_loop)
+
+                self._event_loop.run_until_complete(
+                    self.show_notification(title, message, notification_type, timeout)
+                )
+        except Exception as e:
+            print(f"Visual notification error: {e}")
+            print(f"[{notification_type.upper()}] {title}: {message}")
     
     def notify(
         self,

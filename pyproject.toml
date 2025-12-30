@@ -7,7 +7,7 @@ name = "vibevoice"
 version = "0.1.0"
 description = "Voice-to-text using local Whisper model with keyboard input"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.9"
 authors = [
     { name = "Marc Päpper" }
 ]
@@ -24,7 +24,7 @@ dependencies = [
     "numpy>=1.26.0",
     "requests==2.32.3",
     "pynput==1.7.8",
-    "scipy==1.16.1"
+    "scipy==1.13.1"
 ]
 
 [project.scripts]
