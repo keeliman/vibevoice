@@ -1,40 +1,34 @@
-"""Command-line interface for vibevoice"""
+"""Command-line interface for vibevoice - Real-time streaming transcription with sound feedback."""
 
 import os
-import subprocess
-import time
-import json
-import sounddevice as sd
-import numpy as np
-import requests
 import sys
-import base64
 
-SCREENSHOT_AVAILABLE = False
-try:
-    import pyautogui
-    from PIL import Image
-    SCREENSHOT_AVAILABLE = True
-except ImportError as e:
-    print(f"Screenshot functionality not available: {e}")
-    print("Install Pillow with: pip install Pillow")
+# Add parent directory to path to allow imports when run from root
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
-from pynput.keyboard import Controller as KeyboardController, Key, Listener, KeyCode
-from scipy.io import wavfile
+import threading
+import time
+import numpy as np
+import sounddevice as sd
+from pynput.keyboard import Controller as KeyboardController, Key, Listener
 from dotenv import load_dotenv
 
-from loading_indicator import LoadingIndicator
-
-loading_indicator = LoadingIndicator()
+from vibevoice.audio_capture import StreamingAudioCapture
+from vibevoice.transcriber import StreamingTranscriber
+from vibevoice.loading_indicator import LoadingIndicator
 
 
 def play_start_sound():
-    """Play a modern ascending sound when starting to record"""
+    """Play a modern ascending sound when starting recording"""
+    # Ascending tone: 880Hz (A5) -> 1108Hz (C#6)
     duration = 0.15
     sample_rate = 44100
     t = np.linspace(0, duration, int(sample_rate * duration), False)
 
-    fade_samples = int(0.02 * sample_rate)
+    fade_samples = int(0.03 * sample_rate)
     envelope = np.ones_like(t)
     envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
     envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
@@ -50,6 +44,7 @@ def play_start_sound():
 
 def play_stop_sound():
     """Play a modern descending sound when stopping recording"""
+    # Descending tone: 1108Hz (C#6) -> 659Hz (E5)
     duration = 0.2
     sample_rate = 44100
     t = np.linspace(0, duration, int(sample_rate * duration), False)
@@ -67,201 +62,136 @@ def play_stop_sound():
     audio = (tone * 32767).astype(np.int16)
     sd.play(audio, 44100)
 
-def start_whisper_server():
-    server_script = os.path.join(os.path.dirname(__file__), 'server.py')
-    process = subprocess.Popen(['python', server_script])
-    return process
-
-def wait_for_server(timeout=1800, interval=0.5):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            response = requests.get('http://localhost:4242/health')
-            if response.status_code == 200:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(interval)
-    raise TimeoutError("Server failed to start within timeout")
-
-def capture_screenshot():
-    """Capture a screenshot, save it, and return the path and base64 data."""
-    if not SCREENSHOT_AVAILABLE:
-        print("Screenshot functionality not available. Install Pillow with: pip install Pillow")
-        return None, None
-        
-    try:
-        screenshot_path = os.path.abspath('screenshot.png')
-        print(f"Capturing screenshot to: {screenshot_path}")
-        
-        screenshot = pyautogui.screenshot()
-        
-        max_width = int(os.getenv('SCREENSHOT_MAX_WIDTH', '1024'))
-        width, height = screenshot.size
-        
-        if width > max_width:
-            ratio = max_width / width
-            new_width = max_width
-            new_height = int(height * ratio)
-            screenshot = screenshot.resize((new_width, new_height))
-        
-        screenshot.save(screenshot_path)
-        
-        with open(screenshot_path, "rb") as image_file:
-            base64_data = base64.b64encode(image_file.read()).decode('utf-8')
-        
-        return screenshot_path, base64_data
-    except Exception as e:
-        print(f"Error capturing screenshot: {e}")
-        return None, None
-
-def _process_llm_cmd(keyboard_controller, transcript):
-    """Process transcript with Ollama and type the response."""
-
-    try:
-        loading_indicator.show(message=f"Processing: {transcript}")
-        
-        model = os.getenv('OLLAMA_MODEL', 'gemma3:27b')
-        include_screenshot = os.getenv('INCLUDE_SCREENSHOT', 'true').lower() == 'true'
-        
-        screenshot_path, screenshot_base64 = (None, None)
-        if include_screenshot and SCREENSHOT_AVAILABLE:
-            screenshot_path, screenshot_base64 = capture_screenshot()
-        
-        user_prompt = transcript.strip()
-        
-        system_prompt = """You are a voice-controlled AI assistant. The user is talking to their computer using voice commands.
-Your responses will be directly typed into the user's keyboard at their cursor position, so:
-1. Be concise and to the point, but friendly and engaging - prefer shorter answers
-2. Focus on answering the specific question or request
-3. Don't use introductory phrases like "Here's..." or "Based on the screenshot..."
-4. Don't include formatting like bullet points, which might look strange when typed
-5. If you see a screenshot, analyze it and use it to inform your response
-6. Never apologize for limitations or explain what you're doing"""
-        
-        if screenshot_base64:
-            url = "http://localhost:11434/api/generate"
-            payload = {
-                "model": model,
-                "prompt": user_prompt,
-                "system": system_prompt,
-                "stream": True,
-                "images": [screenshot_base64]  # Pass base64 data directly without data URI prefix
-            }
-            print(f"Sending request with screenshot to model: {model}")
-        else:
-            url = "http://localhost:11434/api/generate"
-            payload = {
-                "model": model,
-                "prompt": user_prompt,
-                "system": system_prompt,
-                "stream": True
-            }
-            print(f"Sending text-only request")
-        
-        response = requests.post(url, json=payload, stream=True)
-        response.raise_for_status()
-        
-        for line in response.iter_lines():
-            if line:
-                data = line.decode('utf-8')
-                if data.startswith('{'):
-                    chunk = json.loads(data)
-                    if 'response' in chunk:
-                        chunk_text = chunk['response']
-                        print(f"Debug - received chunk: {repr(chunk_text)}")
-                        
-                        # Replace smart/curly quotes with standard apostrophes
-                        # U+2018 (') and U+2019 (') are both replaced with standard apostrophe (')
-                        normalized_text = chunk_text.replace('\u2019', "'").replace('\u2018', "'")
-                        
-                        keyboard_controller.type(normalized_text)
-                        loading_indicator.hide()
-        
-        return "Successfully processed with Ollama"
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling Ollama: {e}")
-    finally:
-        loading_indicator.hide()
 
 def main():
+    """Main entry point for vibevoice with real-time streaming and sound feedback."""
     load_dotenv()
-    key_label = os.environ.get("VOICEKEY", "ctrl_r")
-    cmd_label = os.environ.get("VOICEKEY_CMD", "scroll_lock")
+
+    # Configuration from environment variables
+    key_label = os.environ.get("VOICEKEY", "cmd_r")
+    model_size = os.environ.get("WHISPER_MODEL", "small")
+    language = os.environ.get("WHISPER_LANGUAGE", None)
+
     RECORD_KEY = Key[key_label]
-    CMD_KEY = Key[cmd_label]
-#    CMD_KEY = KeyCode(vk=65027)  # This is how you can use non-standard keys, this is AltGr for me
+    keyboard_controller = KeyboardController()
+    loading_indicator = LoadingIndicator()
+
+    # Initialize MLX Whisper transcriber (M1 optimized)
+    print(f"Initializing MLX Whisper (model: {model_size})...")
+    transcriber = StreamingTranscriber(model_size=model_size, language=language)
+    print("Model loaded successfully!")
+
+    # Initialize streaming audio capture
+    audio_capture = StreamingAudioCapture(sample_rate=16000, channels=1)
 
     recording = False
-    audio_data = []
-    sample_rate = 16000
-    keyboard_controller = KeyboardController()
+    transcription_lock = threading.Lock()
+    stop_streaming = False
+
+    def transcribe_phrase(audio_phrase: np.ndarray) -> str:
+        """Transcribe a single audio phrase."""
+        try:
+            audio_float32 = StreamingTranscriber.normalize_audio(audio_phrase)
+            return transcriber.transcribe(audio_float32)
+        except Exception as e:
+            print(f"Transcription error: {e}")
+            return ""
+
+    def stream_worker():
+        """Background thread that processes phrases while recording."""
+        nonlocal recording
+
+        while recording:
+            # Check for new phrases
+            phrases = audio_capture.get_pending_phrases()
+
+            for phrase in phrases:
+                if len(phrase) > 1000:  # Only transcribe if > ~60ms of audio
+                    # Transcribe in background
+                    result = transcribe_phrase(phrase)
+
+                    if result:
+                        # Type the text immediately
+                        print(f"[STREAM] {result}")
+                        keyboard_controller.type(result + " ")
+
+            # Sleep briefly to avoid busy-waiting
+            time.sleep(0.05)
+
+    streaming_thread = None
 
     def on_press(key):
-        nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY and not recording:
+        """Handle key press events."""
+        nonlocal recording, streaming_thread, stop_streaming
+
+        if key == RECORD_KEY and not recording:
             recording = True
-            audio_data = []
-            print("Listening...")
+            stop_streaming = False
+            audio_capture.start_recording()
+            print("Listening... (text will appear as you speak)")
+
+            # Play start sound
             play_start_sound()
 
+            # Start streaming worker thread
+            streaming_thread = threading.Thread(target=stream_worker, daemon=True)
+            streaming_thread.start()
+
     def on_release(key):
-        nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY:
+        """Handle key release events."""
+        nonlocal recording, stop_streaming, streaming_thread
+
+        if key == RECORD_KEY and recording:
             recording = False
-            print("Transcribing...")
+            stop_streaming = True
+            print("Finalizing...")
+
+            # Play stop sound
             play_stop_sound()
-            
-            try:
-                audio_data_np = np.concatenate(audio_data, axis=0)
-            except ValueError as e:
-                print(e)
-                return
-            
-            recording_path = os.path.abspath('recording.wav')
-            audio_data_int16 = (audio_data_np * np.iinfo(np.int16).max).astype(np.int16)
-            wavfile.write(recording_path, sample_rate, audio_data_int16)
 
-            try:
-                response = requests.post('http://localhost:4242/transcribe/', 
-                                      json={'file_path': recording_path})
-                response.raise_for_status()
-                transcript = response.json()['text']
-                
-                if transcript and key == RECORD_KEY:
-                    processed_transcript = transcript + " "
-                    print(processed_transcript)
-                    keyboard_controller.type(processed_transcript)
-                elif transcript and key == CMD_KEY:
-                    _process_llm_cmd(keyboard_controller, transcript)
-            except requests.exceptions.RequestException as e:
-                print(f"Error sending request to local API: {e}")
-            except Exception as e:
-                print(f"Error processing transcript: {e}")
+            # Wait for streaming thread to finish
+            if streaming_thread:
+                streaming_thread.join(timeout=1.0)
 
-    def callback(indata, frames, time, status):
-        if status:
-            print(status)
-        if recording:
-            audio_data.append(indata.copy())
+            # Get any remaining audio and transcribe
+            remaining_audio = audio_capture.stop_recording()
 
-    server_process = start_whisper_server()
-    
+            if len(remaining_audio) > 1000:
+                loading_indicator.show(message="Final transcription...")
+
+                result = transcribe_phrase(remaining_audio)
+
+                loading_indicator.hide()
+
+                if result:
+                    # Check if this was already transcribed
+                    print(f"[FINAL] {result}")
+                    keyboard_controller.type(result + " ")
+
+    # Create audio stream with callback
+    audio_stream = audio_capture.create_stream(
+        callback=audio_capture.get_callback(),
+        sample_rate=16000,
+        channels=1
+    )
+
     try:
-        print(f"Waiting for the server to be ready...")
-        wait_for_server()
-        print(f"vibevoice is active. Hold down {key_label} to start dictating.")
+        print(f"vibevoice is ready for real-time streaming!")
+        print(f"Model: {model_size} | Hold {key_label} to speak")
+        print("Press Ctrl+C to quit.")
+        print("-" * 50)
+
+        # Start keyboard listener and audio stream
         with Listener(on_press=on_press, on_release=on_release) as listener:
-            with sd.InputStream(callback=callback, channels=1, samplerate=sample_rate):
+            with audio_stream:
                 listener.join()
-    except TimeoutError as e:
-        print(f"Error: {e}")
-        server_process.terminate()
-        sys.exit(1)
+
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\nStopping vibevoice...")
     finally:
-        server_process.terminate()
+        if audio_stream:
+            audio_stream.close()
+
 
 if __name__ == "__main__":
     main()
