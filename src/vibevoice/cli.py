@@ -27,6 +27,46 @@ from loading_indicator import LoadingIndicator
 
 loading_indicator = LoadingIndicator()
 
+
+def play_start_sound():
+    """Play a modern ascending sound when starting to record"""
+    duration = 0.15
+    sample_rate = 44100
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+
+    fade_samples = int(0.02 * sample_rate)
+    envelope = np.ones_like(t)
+    envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
+    envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
+
+    freq_start, freq_end = 880, 1108
+    freqs = np.linspace(freq_start, freq_end, len(t))
+    tone = np.sin(2 * np.pi * freqs * t)
+    tone = tone * envelope * 0.3
+
+    audio = (tone * 32767).astype(np.int16)
+    sd.play(audio, 44100)
+
+
+def play_stop_sound():
+    """Play a modern descending sound when stopping recording"""
+    duration = 0.2
+    sample_rate = 44100
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+
+    fade_samples = int(0.03 * sample_rate)
+    envelope = np.ones_like(t)
+    envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
+    envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
+
+    freq_start, freq_end = 1108, 659
+    freqs = np.linspace(freq_start, freq_end, len(t))
+    tone = np.sin(2 * np.pi * freqs * t)
+    tone = tone * envelope * 0.25
+
+    audio = (tone * 32767).astype(np.int16)
+    sd.play(audio, 44100)
+
 def start_whisper_server():
     server_script = os.path.join(os.path.dirname(__file__), 'server.py')
     process = subprocess.Popen(['python', server_script])
@@ -163,12 +203,14 @@ def main():
             recording = True
             audio_data = []
             print("Listening...")
+            play_start_sound()
 
     def on_release(key):
         nonlocal recording, audio_data
         if key == RECORD_KEY or key == CMD_KEY:
             recording = False
             print("Transcribing...")
+            play_stop_sound()
             
             try:
                 audio_data_np = np.concatenate(audio_data, axis=0)
