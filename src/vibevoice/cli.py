@@ -27,16 +27,54 @@ from loading_indicator import LoadingIndicator
 
 loading_indicator = LoadingIndicator()
 
+def _consume_streaming_response(response, keyboard_controller, print_stream=False):
+    """Consume a streaming SSE response and return the full transcript.
+
+    Args:
+        response: The requests.Response object with stream=True
+        keyboard_controller: pynput keyboard controller for typing output
+        print_stream: If True, print segments in real-time as they arrive
+
+    Returns:
+        str: The complete transcript
+    """
+    full_transcript = []
+    try:
+        for line in response.iter_lines(decode_unicode=True):
+            if line:
+                if line.startswith('data: '):
+                    data_str = line[6:]
+                    data_str_stripped = data_str.strip()
+                    if data_str_stripped:
+                        try:
+                            data = json.loads(data_str_stripped)
+                            if 'text' in data:
+                                segment_text = data['text']
+                                full_transcript.append(segment_text)
+                                if print_stream:
+                                    print(segment_text, end=' ', flush=True)
+                                    keyboard_controller.type(segment_text + " ")
+                            if data.get('done'):
+                                if print_stream:
+                                    print()
+                                break
+                        except json.JSONDecodeError as e:
+                            print(f"Error parsing server response: {e}")
+                            break
+    finally:
+        response.close()
+    return " ".join(full_transcript)
+
 def start_whisper_server():
     server_script = os.path.join(os.path.dirname(__file__), 'server.py')
     process = subprocess.Popen(['python', server_script])
     return process
 
-def wait_for_server(timeout=1800, interval=0.5):
+def wait_for_server(timeout=1800, interval=0.1):
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = requests.get('http://localhost:4242/health')
+            response = requests.get('http://localhost:4242/health', timeout=1)
             if response.status_code == 200:
                 return True
         except requests.exceptions.RequestException:
@@ -78,18 +116,20 @@ def capture_screenshot():
 def _process_llm_cmd(keyboard_controller, transcript):
     """Process transcript with Ollama and type the response."""
 
+    screenshot_path = None
+    response = None
     try:
         loading_indicator.show(message=f"Processing: {transcript}")
-        
+
         model = os.getenv('OLLAMA_MODEL', 'gemma3:27b')
         include_screenshot = os.getenv('INCLUDE_SCREENSHOT', 'true').lower() == 'true'
-        
-        screenshot_path, screenshot_base64 = (None, None)
+
+        screenshot_base64 = None
         if include_screenshot and SCREENSHOT_AVAILABLE:
             screenshot_path, screenshot_base64 = capture_screenshot()
-        
+
         user_prompt = transcript.strip()
-        
+
         system_prompt = """You are a voice-controlled AI assistant. The user is talking to their computer using voice commands.
 Your responses will be directly typed into the user's keyboard at their cursor position, so:
 1. Be concise and to the point, but friendly and engaging - prefer shorter answers
@@ -98,7 +138,7 @@ Your responses will be directly typed into the user's keyboard at their cursor p
 4. Don't include formatting like bullet points, which might look strange when typed
 5. If you see a screenshot, analyze it and use it to inform your response
 6. Never apologize for limitations or explain what you're doing"""
-        
+
         if screenshot_base64:
             url = "http://localhost:11434/api/generate"
             payload = {
@@ -118,10 +158,10 @@ Your responses will be directly typed into the user's keyboard at their cursor p
                 "stream": True
             }
             print(f"Sending text-only request")
-        
+
         response = requests.post(url, json=payload, stream=True)
         response.raise_for_status()
-        
+
         for line in response.iter_lines():
             if line:
                 data = line.decode('utf-8')
@@ -130,18 +170,26 @@ Your responses will be directly typed into the user's keyboard at their cursor p
                     if 'response' in chunk:
                         chunk_text = chunk['response']
                         print(f"Debug - received chunk: {repr(chunk_text)}")
-                        
+
                         # Replace smart/curly quotes with standard apostrophes
                         # U+2018 (') and U+2019 (') are both replaced with standard apostrophe (')
                         normalized_text = chunk_text.replace('\u2019', "'").replace('\u2018', "'")
-                        
+
                         keyboard_controller.type(normalized_text)
                         loading_indicator.hide()
-        
+
         return "Successfully processed with Ollama"
     except requests.exceptions.RequestException as e:
         print(f"Error calling Ollama: {e}")
     finally:
+        if response:
+            response.close()
+        # Clean up screenshot file to prevent disk space leaks
+        if screenshot_path and os.path.exists(screenshot_path):
+            try:
+                os.remove(screenshot_path)
+            except OSError:
+                pass
         loading_indicator.hide()
 
 def main():
@@ -169,33 +217,44 @@ def main():
         if key == RECORD_KEY or key == CMD_KEY:
             recording = False
             print("Transcribing...")
-            
+
             try:
                 audio_data_np = np.concatenate(audio_data, axis=0)
             except ValueError as e:
                 print(e)
+                audio_data.clear()
                 return
-            
+
             recording_path = os.path.abspath('recording.wav')
             audio_data_int16 = (audio_data_np * np.iinfo(np.int16).max).astype(np.int16)
             wavfile.write(recording_path, sample_rate, audio_data_int16)
 
             try:
-                response = requests.post('http://localhost:4242/transcribe/', 
-                                      json={'file_path': recording_path})
+                response = requests.post(
+                    'http://localhost:4242/transcribe/',
+                    json={'file_path': recording_path},
+                    stream=True,
+                    timeout=300
+                )
                 response.raise_for_status()
-                transcript = response.json()['text']
-                
-                if transcript and key == RECORD_KEY:
-                    processed_transcript = transcript + " "
-                    print(processed_transcript)
-                    keyboard_controller.type(processed_transcript)
-                elif transcript and key == CMD_KEY:
-                    _process_llm_cmd(keyboard_controller, transcript)
+
+                if key == RECORD_KEY:
+                    _consume_streaming_response(response, keyboard_controller, print_stream=True)
+                elif key == CMD_KEY:
+                    full_transcript = _consume_streaming_response(response, keyboard_controller, print_stream=False)
+                    if full_transcript.strip():
+                        _process_llm_cmd(keyboard_controller, full_transcript.strip())
             except requests.exceptions.RequestException as e:
                 print(f"Error sending request to local API: {e}")
             except Exception as e:
                 print(f"Error processing transcript: {e}")
+            finally:
+                # Clean up audio data and temporary file to prevent memory leaks
+                audio_data.clear()
+                try:
+                    os.remove(recording_path)
+                except OSError:
+                    pass
 
     def callback(indata, frames, time, status):
         if status:
