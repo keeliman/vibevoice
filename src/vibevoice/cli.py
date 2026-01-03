@@ -29,7 +29,7 @@ loading_indicator = LoadingIndicator()
 
 def start_whisper_server():
     server_script = os.path.join(os.path.dirname(__file__), 'server.py')
-    process = subprocess.Popen(['python', server_script])
+    process = subprocess.Popen([sys.executable, server_script])
     return process
 
 def wait_for_server(timeout=1800, interval=0.5):
@@ -146,10 +146,20 @@ Your responses will be directly typed into the user's keyboard at their cursor p
 
 def main():
     load_dotenv()
-    key_label = os.environ.get("VOICEKEY", "ctrl_r")
+    key_label = os.environ.get("VOICEKEY", "cmd_r")
     cmd_label = os.environ.get("VOICEKEY_CMD", "scroll_lock")
-    RECORD_KEY = Key[key_label]
-    CMD_KEY = Key[cmd_label]
+
+    # Handle cmd_r which is now available in pynput Key enum
+    if key_label == "cmd_r":
+        RECORD_KEY = Key.cmd_r
+    else:
+        RECORD_KEY = Key[key_label]
+
+    # Handle cmd_key - disabled by default, only use cmd_r
+    if cmd_label == "scroll_lock":
+        CMD_KEY = None  # Disabled - only use cmd_r
+    else:
+        CMD_KEY = Key[cmd_label]
 #    CMD_KEY = KeyCode(vk=65027)  # This is how you can use non-standard keys, this is AltGr for me
 
     recording = False
@@ -159,14 +169,14 @@ def main():
 
     def on_press(key):
         nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY and not recording:
+        if key == RECORD_KEY and not recording:
             recording = True
             audio_data = []
             print("Listening...")
 
     def on_release(key):
         nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY:
+        if key == RECORD_KEY:
             recording = False
             print("Transcribing...")
             
