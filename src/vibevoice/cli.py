@@ -29,7 +29,7 @@ loading_indicator = LoadingIndicator()
 
 def start_whisper_server():
     server_script = os.path.join(os.path.dirname(__file__), 'server.py')
-    process = subprocess.Popen(['python', server_script])
+    process = subprocess.Popen([sys.executable, server_script])
     return process
 
 def wait_for_server(timeout=1800, interval=0.5):
@@ -144,12 +144,82 @@ Your responses will be directly typed into the user's keyboard at their cursor p
     finally:
         loading_indicator.hide()
 
+def generate_modern_sound(frequency, duration, volume=0.3):
+    """Generate a modern notification sound using sine wave with fade in/out"""
+    sample_rate = 44100
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    
+    # Apply fade in and fade out for smooth sound
+    fade_duration = 0.05
+    fade_samples = int(fade_duration * sample_rate)
+    envelope = np.ones_like(t)
+    envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
+    envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
+    
+    # Generate tone with harmonic overtones for richer sound
+    tone = (np.sin(2 * np.pi * frequency * t) + 
+            0.3 * np.sin(2 * np.pi * frequency * 2 * t) +
+            0.1 * np.sin(2 * np.pi * frequency * 3 * t))
+    
+    audio = tone * envelope * volume
+    return (audio * 32767).astype(np.int16)
+
+def play_start_sound():
+    """Play a modern ascending sound when starting to record"""
+    # Ascending tone: 880Hz (A5) -> 1108Hz (C#6)
+    duration = 0.15
+    sample_rate = 44100
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    
+    fade_samples = int(0.02 * sample_rate)
+    envelope = np.ones_like(t)
+    envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
+    envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
+    
+    freq_start, freq_end = 880, 1108
+    freqs = np.linspace(freq_start, freq_end, len(t))
+    tone = np.sin(2 * np.pi * freqs * t)
+    tone = tone * envelope * 0.3
+    
+    audio = (tone * 32767).astype(np.int16)
+    sd.play(audio, 44100)
+
+def play_stop_sound():
+    """Play a modern descending sound when stopping recording"""
+    # Descending tone: 1108Hz (C#6) -> 659Hz (E5)
+    duration = 0.2
+    sample_rate = 44100
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    
+    fade_samples = int(0.03 * sample_rate)
+    envelope = np.ones_like(t)
+    envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
+    envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
+    
+    freq_start, freq_end = 1108, 659
+    freqs = np.linspace(freq_start, freq_end, len(t))
+    tone = np.sin(2 * np.pi * freqs * t)
+    tone = tone * envelope * 0.25
+    
+    audio = (tone * 32767).astype(np.int16)
+    sd.play(audio, 44100)
+
 def main():
     load_dotenv()
-    key_label = os.environ.get("VOICEKEY", "ctrl_r")
+    key_label = os.environ.get("VOICEKEY", "cmd_r")
     cmd_label = os.environ.get("VOICEKEY_CMD", "scroll_lock")
-    RECORD_KEY = Key[key_label]
-    CMD_KEY = Key[cmd_label]
+    
+    # Handle cmd_r which is now available in pynput Key enum
+    if key_label == "cmd_r":
+        RECORD_KEY = Key.cmd_r
+    else:
+        RECORD_KEY = Key[key_label]
+    
+    # Handle cmd_key - disabled by default, only use cmd_r
+    if cmd_label == "scroll_lock":
+        CMD_KEY = None  # Disabled - only use cmd_r
+    else:
+        CMD_KEY = Key[cmd_label]
 #    CMD_KEY = KeyCode(vk=65027)  # This is how you can use non-standard keys, this is AltGr for me
 
     recording = False
@@ -159,16 +229,18 @@ def main():
 
     def on_press(key):
         nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY and not recording:
+        if key == RECORD_KEY and not recording:
             recording = True
             audio_data = []
             print("Listening...")
+            play_start_sound()
 
     def on_release(key):
         nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY:
+        if key == RECORD_KEY:
             recording = False
             print("Transcribing...")
+            play_stop_sound()
             
             try:
                 audio_data_np = np.concatenate(audio_data, axis=0)
@@ -179,19 +251,23 @@ def main():
             recording_path = os.path.abspath('recording.wav')
             audio_data_int16 = (audio_data_np * np.iinfo(np.int16).max).astype(np.int16)
             wavfile.write(recording_path, sample_rate, audio_data_int16)
+            print(f"DEBUG: Audio data shape: {audio_data_np.shape}, Duration: {len(audio_data_np)/sample_rate:.2f}s")
 
             try:
-                response = requests.post('http://localhost:4242/transcribe/', 
+                response = requests.post('http://localhost:4242/transcribe/',
                                       json={'file_path': recording_path})
                 response.raise_for_status()
                 transcript = response.json()['text']
-                
+                print(f"DEBUG: Transcript received: '{transcript}'")
+
                 if transcript and key == RECORD_KEY:
                     processed_transcript = transcript + " "
                     print(processed_transcript)
                     keyboard_controller.type(processed_transcript)
                 elif transcript and key == CMD_KEY:
                     _process_llm_cmd(keyboard_controller, transcript)
+                else:
+                    print("DEBUG: Transcript is empty or key doesn't match")
             except requests.exceptions.RequestException as e:
                 print(f"Error sending request to local API: {e}")
             except Exception as e:
@@ -208,6 +284,18 @@ def main():
     try:
         print(f"Waiting for the server to be ready...")
         wait_for_server()
+        
+        # List available audio devices
+        devices = sd.query_devices()
+        print(f"Available audio devices:")
+        for i, dev in enumerate(devices):
+            if dev['max_input_channels'] > 0:
+                print(f"  [{i}] {dev['name']} (inputs: {dev['max_input_channels']})")
+        
+        # Try to get default input device
+        default_device = sd.query_devices(kind='input')
+        print(f"Using default input device: {default_device['name']}")
+        
         print(f"vibevoice is active. Hold down {key_label} to start dictating.")
         with Listener(on_press=on_press, on_release=on_release) as listener:
             with sd.InputStream(callback=callback, channels=1, samplerate=sample_rate):
