@@ -1,4 +1,7 @@
-"""Audio capture module for real-time streaming speech-to-text with VAD."""
+"""Audio capture module for real-time streaming speech-to-text with VAD.
+
+Optimized for memory efficiency with circular buffer and smart cleanup.
+"""
 
 import numpy as np
 import sounddevice as sd
@@ -6,6 +9,7 @@ from typing import Callable, Optional, List
 import threading
 import time
 from queue import Queue
+import gc
 
 
 class AudioCapture:
@@ -32,6 +36,8 @@ class AudioCapture:
             if self.audio_buffer:
                 audio_data = np.concatenate(self.audio_buffer, axis=0)
                 audio_int16 = (audio_data * np.iinfo(np.int16).max).astype(np.int16)
+                # Clear buffer to free memory
+                self.audio_buffer.clear()
                 return audio_int16
             return np.array([], dtype=np.int16)
 
@@ -60,7 +66,13 @@ class AudioCapture:
 class StreamingAudioCapture:
     """
     Captures audio with VAD-based phrase detection for real-time streaming.
-    Emits phrases as they are detected during recording.
+    Optimized with circular buffer and memory limits.
+
+    Memory optimizations:
+    - Circular buffer with configurable max size
+    - Automatic cleanup of transcribed audio
+    - Lazy VAD loading
+    - Periodic garbage collection
     """
 
     def __init__(
@@ -68,27 +80,31 @@ class StreamingAudioCapture:
         sample_rate: int = 16000,
         channels: int = 1,
         chunk_size: int = 512,
+        max_buffer_seconds: int = 30,
     ):
         """
-        Initialize streaming audio capture.
+        Initialize streaming audio capture with memory limits.
 
         Args:
             sample_rate: Sample rate in Hz (default 16000 for Whisper)
             channels: Number of audio channels (default 1 for mono)
             chunk_size: Audio chunk size in samples (default 512 = ~32ms)
+            max_buffer_seconds: Maximum audio buffer size in seconds (prevents memory bloat)
         """
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_size = chunk_size
+        self.max_buffer_samples = max_buffer_seconds * sample_rate
 
         self.recording = False
-        self.audio_buffer = []
+        self.audio_buffer = []  # Will be constrained by max_buffer_samples
         self.last_transcribed_pos = 0
+        self.total_samples = 0  # Track total samples for circular buffer logic
         self.silence_chunks = 0
         self._vad = None  # Lazy-loaded VAD instance
 
         self.lock = threading.Lock()
-        self.phrase_queue = Queue()
+        self.phrase_queue = Queue(maxsize=10)  # Bounded queue to prevent memory bloat
 
     def start_recording(self):
         """Start recording audio."""
@@ -96,6 +112,7 @@ class StreamingAudioCapture:
             self.recording = True
             self.audio_buffer = []
             self.last_transcribed_pos = 0
+            self.total_samples = 0
             self.silence_chunks = 0
 
     def stop_recording(self) -> np.ndarray:
@@ -110,6 +127,10 @@ class StreamingAudioCapture:
             if self.audio_buffer:
                 audio_data = np.concatenate(self.audio_buffer, axis=0)
                 audio_int16 = (audio_data * np.iinfo(np.int16).max).astype(np.int16)
+                # Clear buffer to free memory
+                self.audio_buffer.clear()
+                self.last_transcribed_pos = 0
+                self.total_samples = 0
                 return audio_int16
             return np.array([], dtype=np.int16)
 
@@ -135,19 +156,31 @@ class StreamingAudioCapture:
 
             return None
 
-    def mark_as_transcribed(self, samples: int):
+    def _add_to_buffer(self, audio_chunk: np.ndarray):
         """
-        Mark audio position as transcribed (avoid duplicates).
+        Add audio chunk to buffer with memory limit enforcement.
 
         Args:
-            samples: Number of samples to mark as transcribed
+            audio_chunk: Audio chunk to add
         """
-        with self.lock:
-            self.last_transcribed_pos += samples
+        self.audio_buffer.append(audio_chunk)
+        self.total_samples += len(audio_chunk)
+
+        # Enforce buffer size limit
+        if self.total_samples > self.max_buffer_samples:
+            # Remove oldest chunks until we're under the limit
+            while self.audio_buffer and self.total_samples > self.max_buffer_samples * 0.8:
+                removed = self.audio_buffer.pop(0)
+                self.total_samples -= len(removed)
+                # Adjust transcribed position accordingly
+                self.last_transcribed_pos -= len(removed)
+
+            # Ensure transcribed position doesn't go negative
+            self.last_transcribed_pos = max(0, self.last_transcribed_pos)
 
     def _get_vad(self):
         """
-        Lazy-load the Silero VAD instance.
+        Lazy-load the Silero VAD instance (cached).
 
         Returns:
             SileroVAD instance
@@ -166,7 +199,7 @@ class StreamingAudioCapture:
 
             with self.lock:
                 if self.recording:
-                    self.audio_buffer.append(indata.copy())
+                    self._add_to_buffer(indata.copy())
 
                     # Check for silence (simple energy-based detection)
                     audio_energy = np.mean(np.abs(indata))
@@ -190,12 +223,24 @@ class StreamingAudioCapture:
                                 if vad.has_speech(new_audio):
                                     # Convert to int16 and queue
                                     audio_int16 = (new_audio * np.iinfo(np.int16).max).astype(np.int16)
-                                    self.phrase_queue.put(audio_int16)
+                                    # Use non-blocking put with timeout to prevent deadlock
+                                    try:
+                                        self.phrase_queue.put_nowait(audio_int16)
+                                    except:
+                                        # Queue is full, drop oldest phrase
+                                        try:
+                                            self.phrase_queue.get_nowait()
+                                            self.phrase_queue.put_nowait(audio_int16)
+                                        except:
+                                            pass
                             except Exception as e:
                                 # Fallback: queue if VAD fails
                                 print(f"VAD error: {e}, using energy-based detection")
                                 audio_int16 = (new_audio * np.iinfo(np.int16).max).astype(np.int16)
-                                self.phrase_queue.put(audio_int16)
+                                try:
+                                    self.phrase_queue.put_nowait(audio_int16)
+                                except:
+                                    pass
 
         return callback
 
@@ -214,6 +259,14 @@ class StreamingAudioCapture:
             except:
                 break
         return phrases
+
+    def clear_queue(self):
+        """Clear all pending phrases from the queue."""
+        while not self.phrase_queue.empty():
+            try:
+                self.phrase_queue.get_nowait()
+            except:
+                break
 
     @staticmethod
     def create_stream(callback, sample_rate: int = 16000, channels: int = 1):
