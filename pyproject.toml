@@ -12,19 +12,14 @@ authors = [
     { name = "Marc Päpper" }
 ]
 dependencies = [
-    "fastapi==0.104.1",
-    "uvicorn==0.23.2",
-    "faster-whisper==1.1.1",
-    "ctranslate2==4.6.0",
-    "torch==2.8.0",
-    "torchaudio==2.8.0",
-    "python-multipart==0.0.7",
+    "mlx-whisper>=0.1.0",
     "python-dotenv==1.0.0",
     "sounddevice==0.4.6",
     "numpy>=1.26.0",
-    "requests==2.32.3",
     "pynput==1.7.8",
-    "scipy==1.16.1"
+    "scipy==1.16.1",
+    "torch>=2.0.0",
+    "huggingface-hub>=0.20.0"
 ]
 
 [project.scripts]

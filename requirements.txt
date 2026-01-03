@@ -1,16 +1,13 @@
-fastapi==0.104.1
-uvicorn==0.23.2
-faster-whisper==1.1.1
---extra-index-url https://download.pytorch.org/whl/cu124
-ctranslate2==4.6.2
-torch==2.9.0
-torchaudio==2.9.0
-python-multipart==0.0.7
+# Core dependencies
+mlx-whisper>=0.1.0
 python-dotenv==1.0.0
 sounddevice==0.4.6
 numpy>=1.26.0
-requests==2.32.3
 pynput==1.7.8
 scipy==1.16.1
-pyautogui==0.9.54
-Pillow==11.1.0
+
+# VAD support
+torch>=2.0.0
+
+# Optional: for downloading models
+huggingface-hub>=0.20.0
