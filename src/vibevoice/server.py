@@ -7,9 +7,9 @@ from faster_whisper import WhisperModel
 
 app = FastAPI()
 
-model = WhisperModel("large", device="cuda", compute_type="float16")
-# Enable in case you want to run on CPU, but it's much slower
-#model = WhisperModel("medium", device="cpu", compute_type="int8")
+# Use CPU for macOS (CUDA is for NVIDIA GPUs)
+#model = WhisperModel("large", device="cuda", compute_type="float16")
+model = WhisperModel("small", device="cpu", compute_type="int8")
 
 class TranscribeRequest(BaseModel):
     file_path: str
@@ -20,8 +20,22 @@ def health_check():
 
 @app.post("/transcribe/")
 async def transcribe(request: TranscribeRequest):
-    segments, info = model.transcribe(request.file_path)
-    text = " ".join([segment.text.strip() for segment in segments])
+    print(f"DEBUG: Transcribing file: {request.file_path}")
+    segments, info = model.transcribe(
+        request.file_path,
+        language="fr",
+        beam_size=1,
+        best_of=1,
+        no_speech_threshold=0.1,  # Lowered from 0.6 to be less aggressive
+        vad_filter=False,  # Disable VAD filter to prevent false negatives
+        condition_on_previous_text=False
+    )
+    print(f"DEBUG: Info: {info}")
+    segments_list = list(segments)  # Convert generator to list
+    print(f"DEBUG: Number of segments: {len(segments_list)}")
+    all_text = [segment.text.strip() for segment in segments_list]
+    print(f"DEBUG: Segments text: {all_text}")
+    text = " ".join(all_text)
     return {"text": text}
 
 def run_server():
