@@ -122,7 +122,7 @@ Your responses will be directly typed into the user's keyboard at their cursor p
         response = requests.post(url, json=payload, stream=True)
         response.raise_for_status()
         
-        for line in response.iter_lines():
+        for line in response.iter_lines(chunk_size=1):
             if line:
                 data = line.decode('utf-8')
                 if data.startswith('{'):
